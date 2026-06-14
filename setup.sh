@@ -18,7 +18,7 @@ echo "============================================="
 echo ""
 
 # --- Checks ---
-echo "[1/8] Checking prerequisites..."
+echo "[1/9] Checking prerequisites..."
 
 for cmd in docker git curl; do
     if ! command -v "$cmd" &> /dev/null; then
@@ -50,7 +50,7 @@ echo "  curl:       OK"
 
 # --- Config ---
 echo ""
-echo "[2/8] Setting up configuration..."
+echo "[2/9] Setting up configuration..."
 
 CONFIG_FILE="${SCRIPT_DIR}/config.json"
 
@@ -90,7 +90,7 @@ fi
 
 # --- Prometheus config ---
 echo ""
-echo "[3/8] Creating Prometheus configuration..."
+echo "[3/9] Creating Prometheus configuration..."
 
 mkdir -p "${SCRIPT_DIR}/prometheus"
 
@@ -111,7 +111,7 @@ echo "  Written: prometheus/prometheus.yml"
 
 # --- Grafana provisioning ---
 echo ""
-echo "[4/8] Creating Grafana provisioning..."
+echo "[4/9] Creating Grafana provisioning..."
 
 mkdir -p "${SCRIPT_DIR}/grafana/provisioning/datasources"
 mkdir -p "${SCRIPT_DIR}/grafana/provisioning/dashboards/json"
@@ -231,20 +231,20 @@ sed -i "s/GF_SECURITY_ADMIN_PASSWORD:.*/GF_SECURITY_ADMIN_PASSWORD: ${GRAFANA_PA
 
 # --- Build ---
 echo ""
-echo "[5/8] Building Docker image (this takes a few minutes on first run)..."
+echo "[5/9] Building Docker image (this takes a few minutes on first run)..."
 
 docker compose build 2>&1 | tail -5
 
 # --- Start ---
 echo ""
-echo "[6/8] Starting services..."
+echo "[6/9] Starting services..."
 
 docker compose down 2>/dev/null || true
 docker compose up -d
 
 # --- Wait for services ---
 echo ""
-echo "[7/8] Waiting for services to start..."
+echo "[7/9] Waiting for services to start..."
 
 MAX_WAIT=30
 WAITED=0
@@ -262,7 +262,7 @@ done
 
 # --- Verify ---
 echo ""
-echo "[8/8] Verifying services..."
+echo "[8/9] Verifying services..."
 echo ""
 
 print_status() {
@@ -282,6 +282,23 @@ print_status "Router"     "http://127.0.0.1:8082/health"        "http://${IP_ADD
 print_status "Metrics"    "http://127.0.0.1:8082/metrics"       "http://${IP_ADDR}:8082/metrics"
 print_status "Prometheus" "http://127.0.0.1:9090/-/healthy"     "http://${IP_ADDR}:9090"
 print_status "Grafana"     "http://127.0.0.1:3000/api/health"   "http://${IP_ADDR}:3000"
+
+# --- Systemd service ---
+echo ""
+echo "[9/9] Installing systemd service..."
+
+SERVICE_FILE="${SCRIPT_DIR}/deploy/systemd/tavily-router.service"
+
+if [ ! -f "$SERVICE_FILE" ]; then
+    echo "  WARNING: systemd unit file not found at ${SERVICE_FILE}"
+    echo "  Skipping systemd setup. You can start services with: docker compose up -d"
+else
+    sed "s|__WORKINGDIR__|${SCRIPT_DIR}|" "$SERVICE_FILE" | sudo tee /etc/systemd/system/tavily-router.service > /dev/null
+    sudo systemctl daemon-reload
+    sudo systemctl enable tavily-router
+    echo "  systemd service installed and enabled."
+    echo "  Services will auto-start on boot."
+fi
 
 echo ""
 echo "============================================="
@@ -312,4 +329,6 @@ echo "   docker compose logs tavily-router         Router logs only"
 echo "   docker compose restart tavily-router      Restart router"
 echo "   docker compose down                        Stop all services"
 echo "   docker compose up -d                       Start all services"
+echo "   sudo systemctl status tavily-router        Service status"
+echo "   sudo systemctl restart tavily-router      Restart via systemd"
 echo ""

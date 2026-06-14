@@ -55,9 +55,6 @@ echo "[2/5] Setting up configuration..."
 CONFIG_FILE="${SCRIPT_DIR}/config.json"
 
 if [ ! -f "$CONFIG_FILE" ]; then
-    echo "  Creating config.json from config.example.json..."
-    cp config.example.json config.json
-
     if [ -z "${TAVILY_KEYS:-}" ]; then
         echo ""
         echo "  You need at least one Tavily API key."
@@ -69,14 +66,46 @@ if [ ! -f "$CONFIG_FILE" ]; then
             echo "  ERROR: No keys provided. Set TAVILY_KEYS and re-run."
             exit 1
         fi
-        JSON_KEYS=$(echo "$KEYS_INPUT" | sed 's/,/","/g' | sed 's/^/"/;s/$/"/' | sed 's/ //g')
-        sed -i "s/\"tvly-YOUR-API-KEY-HERE\"/[$JSON_KEYS]/" "$CONFIG_FILE"
     else
-        echo "  Using TAVILY_KEYS from environment (${#TAVILY_KEYS} chars)"
+        KEYS_INPUT="$TAVILY_KEYS"
     fi
 
-    sed -i 's/"enable_prometheus": false/"enable_prometheus": true/' "$CONFIG_FILE"
-    echo "  Prometheus enabled."
+    JSON_KEYS="["
+    FIRST=true
+    IFS=','
+    for KEY in $KEYS_INPUT; do
+        KEY=$(echo "$KEY" | xargs)
+        if [ -z "$KEY" ]; then
+            continue
+        fi
+        if [ "$FIRST" = true ]; then
+            FIRST=false
+        else
+            JSON_KEYS="$JSON_KEYS, "
+        fi
+        JSON_KEYS="$JSON_KEYS\"$KEY\""
+    done
+    unset IFS
+    JSON_KEYS="$JSON_KEYS]"
+
+    cat > "$CONFIG_FILE" <<EOF
+{
+  "listen_addr": "0.0.0.0:8082",
+  "upstream_base": "https://api.tavily.com",
+  "keys": $JSON_KEYS,
+  "strategy": "least_used",
+  "cooldown_sec": 300,
+  "max_fails_before_cooldown": 3,
+  "health_check_timeout_seconds": 10,
+  "admin_user": "admin",
+  "admin_pass": "",
+  "enable_prometheus": true,
+  "enable_request_log": false,
+  "log_file": ""
+}
+EOF
+
+    echo "  Created config.json with $(echo "$KEYS_INPUT" | tr ',' '\n' | grep -c .) key(s)."
 else
     echo "  config.json already exists."
     if grep -q '"enable_prometheus": false' "$CONFIG_FILE"; then

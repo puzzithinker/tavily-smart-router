@@ -9,7 +9,7 @@ services:
     volumes:
       - ./config.json:/config.json:ro
     environment:
-      - TAVILY_KEYS=${TAVILY_KEYS}
+      - TAVILY_CONFIG=/config.json
     networks:
       - routers
     restart: unless-stopped

@@ -1,0 +1,14 @@
+{
+  "listen_addr": "0.0.0.0:8082",
+  "upstream_base": "https://api.tavily.com",
+  "keys": ["tvly-YOUR-API-KEY-HERE"],
+  "strategy": "least_used",
+  "cooldown_sec": 300,
+  "max_fails_before_cooldown": 3,
+  "health_check_timeout_seconds": 10,
+  "admin_user": "admin",
+  "admin_pass": "",
+  "enable_prometheus": false,
+  "enable_request_log": false,
+  "log_file": ""
+}

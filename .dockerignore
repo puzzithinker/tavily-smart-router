@@ -1,0 +1,14 @@
+bin/
+*.exe
+*.test
+*.prof
+.git
+.github
+docs/
+deploy/
+examples/
+*.md
+.dockerignore
+Makefile
+config.json
+config.example.json

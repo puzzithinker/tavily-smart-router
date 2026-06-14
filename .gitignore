@@ -1,0 +1,21 @@
+# Build artifacts
+bin/
+*.exe
+*.test
+*.prof
+
+# Config with secrets (root only)
+/config.json
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Logs
+*.log

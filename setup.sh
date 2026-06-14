@@ -280,8 +280,8 @@ IP_ADDR=$(hostname -I 2>/dev/null | awk '{print $1}')
 
 print_status "Router"     "http://127.0.0.1:8082/health"        "http://${IP_ADDR}:8082/health"
 print_status "Metrics"    "http://127.0.0.1:8082/metrics"       "http://${IP_ADDR}:8082/metrics"
-print_status "Prometheus" "http://127.0.0.1:9090/-/healthy"     "http://${IP_ADDR}:9090"
-print_status "Grafana"     "http://127.0.0.1:3000/api/health"   "http://${IP_ADDR}:3000"
+print_status "Prometheus" "http://127.0.0.1:9091/-/healthy"     "http://${IP_ADDR}:9091"
+print_status "Grafana"     "http://127.0.0.1:3001/api/health"   "http://${IP_ADDR}:3001"
 
 # --- Systemd service ---
 echo ""
@@ -310,8 +310,8 @@ echo ""
 echo "   Router:        http://${IP_ADDR}:8082"
 echo "   Health:        http://${IP_ADDR}:8082/health"
 echo "   Admin Stats:   http://${IP_ADDR}:8082/admin/stats"
-echo "   Prometheus:    http://${IP_ADDR}:9090"
-echo "   Grafana:       http://${IP_ADDR}:3000"
+echo "   Prometheus:    http://${IP_ADDR}:9091"
+echo "   Grafana:       http://${IP_ADDR}:3001"
 echo ""
 echo " Grafana login:"
 echo "   Username: admin"

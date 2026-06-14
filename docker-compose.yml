@@ -10,6 +10,8 @@ services:
       - ./config.json:/config.json:ro
     environment:
       - TAVILY_KEYS=${TAVILY_KEYS}
+    networks:
+      - routers
     restart: unless-stopped
     deploy:
       resources:
@@ -17,35 +19,7 @@ services:
           memory: 256M
           cpus: "0.5"
 
-  prometheus:
-    image: prom/prometheus:latest
-    volumes:
-      - ./prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
-    ports:
-      - "9091:9090"
-    restart: unless-stopped
-    deploy:
-      resources:
-        limits:
-          memory: 128M
-          cpus: "0.25"
-
-  grafana:
-    image: grafana/grafana:latest
-    volumes:
-      - ./grafana/provisioning:/etc/grafana/provisioning:ro
-      - grafana-storage:/var/lib/grafana
-    ports:
-      - "3001:3000"
-    environment:
-      - GF_SECURITY_ADMIN_PASSWORD=admin
-      - GF_USERS_ALLOW_SIGN_UP=false
-    restart: unless-stopped
-    deploy:
-      resources:
-        limits:
-          memory: 128M
-          cpus: "0.25"
-
-volumes:
-  grafana-storage:
+networks:
+  routers:
+    name: smart-routers
+    external: true

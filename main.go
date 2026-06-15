@@ -165,6 +165,7 @@ type KeyRotator struct {
 	keys     []*KeyEntry
 	strategy string
 	counter  atomic.Int64
+	mu       sync.Mutex
 }
 
 func NewKeyRotator(keys []string, strategy string) *KeyRotator {
@@ -220,16 +221,14 @@ func (kr *KeyRotator) PickKey() (*KeyEntry, error) {
 		return nil, fmt.Errorf("all keys are unavailable")
 
 	case "least_used":
+		kr.mu.Lock()
 		var best *KeyEntry
 		var bestCount int64 = -1
 		for _, entry := range kr.keys {
-			entry.mu.Lock()
 			if entry.State == KeyDisabled {
-				entry.mu.Unlock()
 				continue
 			}
 			if entry.State == KeyCooldown && now.Before(entry.CooldownUntil) {
-				entry.mu.Unlock()
 				continue
 			}
 			if entry.State == KeyCooldown {
@@ -237,23 +236,18 @@ func (kr *KeyRotator) PickKey() (*KeyEntry, error) {
 				entry.CooldownUntil = time.Time{}
 			}
 			if bestCount < 0 || entry.UsageCount < bestCount {
-				if best != nil {
-					best.mu.Unlock()
-				}
 				bestCount = entry.UsageCount
 				best = entry
-				// best stays locked, we'll use it
-				continue
 			}
-			entry.mu.Unlock()
 		}
 		if best == nil {
+			kr.mu.Unlock()
 			return nil, fmt.Errorf("all keys are unavailable")
 		}
 		best.UsageCount++
 		best.FailCount = 0
 		best.LastUsed = now
-		best.mu.Unlock()
+		kr.mu.Unlock()
 
 		if cfg.EnablePrometheus {
 			keyUsageTotal.WithLabelValues(best.Key).Inc()

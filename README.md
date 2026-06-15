@@ -9,7 +9,7 @@ Built on the same philosophy as [opencode-smart-router](https://github.com/puzzi
 - **Transparent Key Rotation** — Automatically cycles through multiple Tavily API keys. Callers see a single endpoint, the router handles the rest.
 - **Automatic Failover** — When a key hits a rate limit (429), the router retries with the next available key. Callers never see the retry.
 - **Smart Error Classification** — Distinguishes rate limits, auth failures, quota exhaustion, and upstream errors. Each error type triggers the appropriate key state transition.
-- **Tavily-Specific Error Handling** — Handles Tavily-unique status codes 432 (plan limit) and 433 (PayGo limit) as permanent key disablement.
+- **Tavily-Specific Error Handling** — Handles Tavily-unique status codes 432 (plan limit) and 433 (PayGo limit) as temporary cooldown (quotas reset monthly).
 - **Consecutive Failure Tracking** — Keys enter cooldown only after N consecutive failures (configurable), preventing transient 5xx errors from disabling keys prematurely.
 - **Two Rotation Strategies** — `least_used` (default) balances load across keys; `round_robin` cycles evenly.
 - **Health Check** — `POST /search` with a minimal payload to verify both key validity and upstream connectivity.
@@ -72,6 +72,7 @@ docker compose up -d
   "strategy": "least_used",
   "cooldown_sec": 300,
   "max_fails_before_cooldown": 3,
+  "quota_cooldown_sec": 86400,
   "health_check_timeout_seconds": 10,
   "admin_user": "admin",
   "admin_pass": "",
@@ -90,6 +91,7 @@ docker compose up -d
 | `TAVILY_LISTEN_ADDR` | `listen_addr` |
 | `TAVILY_STRATEGY` | `strategy` |
 | `TAVILY_COOLDOWN_SEC` | `cooldown_sec` |
+| `TAVILY_QUOTA_COOLDOWN_SEC` | `quota_cooldown_sec` |
 | `TAVILY_CONFIG` | Config file path (default: `config.json`) |
 
 ### Config Reference
@@ -102,6 +104,7 @@ docker compose up -d
 | `strategy` | string | `least_used` | `round_robin` or `least_used` |
 | `cooldown_sec` | int | `300` | Cooldown duration in seconds (min 30) |
 | `max_fails_before_cooldown` | int | `3` | Consecutive failures before cooldown (min 1) |
+| `quota_cooldown_sec` | int | `86400` | Cooldown duration in seconds for quota-exhausted keys. Keys are retried after this period. Quotas reset monthly, so keys auto-recover. Minimum 60. |
 | `health_check_timeout_seconds` | int | `10` | Timeout for health check requests |
 | `admin_user` | string | `admin` | Basic auth username for `/admin/stats` |
 | `admin_pass` | string | `""` | Basic auth password. Empty = admin disabled |
@@ -153,9 +156,9 @@ All Tavily API paths are proxied:
 | 2xx | HEALTHY | No | Success — key is marked healthy |
 | 401 / 403 | DISABLED | Yes | Invalid key — permanently disabled |
 | 429 (rate limit) | COOLDOWN | Yes | Rate limited — cooldown for `Retry-After` or default |
-| 429 (quota) | DISABLED | Yes | Quota exhausted — permanently disabled |
-| 432 | DISABLED | Yes | Tavily plan limit — permanently disabled |
-| 433 | DISABLED | Yes | Tavily PayGo limit — permanently disabled |
+| 429 (quota) | COOLDOWN (quota_cooldown_sec) | Yes | Quota exhausted — cooldown, auto-recovers. Quotas reset monthly |
+| 432 | COOLDOWN (quota_cooldown_sec) | Yes | Tavily plan limit — cooldown, auto-recovers. Quotas reset monthly |
+| 433 | COOLDOWN (quota_cooldown_sec) | Yes | Tavily PayGo limit — cooldown, auto-recovers. Quotas reset monthly |
 | 5xx | Fail tracked | No | Upstream issue — tracked for consecutive failure threshold |
 | Timeout | COOLDOWN (10s) | No | Connection issue — short cooldown |
 

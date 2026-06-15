@@ -34,6 +34,7 @@ type Config struct {
 	Strategy                  string   `json:"strategy"`
 	CooldownSec               int      `json:"cooldown_sec"`
 	MaxFailsBeforeCooldown    int      `json:"max_fails_before_cooldown"`
+	QuotaCooldownSec          int      `json:"quota_cooldown_sec"`
 	HealthCheckTimeoutSeconds int      `json:"health_check_timeout_seconds"`
 	AdminUser                 string   `json:"admin_user"`
 	AdminPass                 string   `json:"admin_pass"`
@@ -69,6 +70,9 @@ func LoadConfig(path string) (*Config, error) {
 	if cfg.MaxFailsBeforeCooldown == 0 {
 		cfg.MaxFailsBeforeCooldown = 3
 	}
+	if cfg.QuotaCooldownSec == 0 {
+		cfg.QuotaCooldownSec = 86400
+	}
 	if cfg.HealthCheckTimeoutSeconds == 0 {
 		cfg.HealthCheckTimeoutSeconds = 10
 	}
@@ -89,6 +93,11 @@ func LoadConfig(path string) (*Config, error) {
 	if v := os.Getenv("TAVILY_COOLDOWN_SEC"); v != "" {
 		if sec, err := strconv.Atoi(v); err == nil {
 			cfg.CooldownSec = sec
+		}
+	}
+	if v := os.Getenv("TAVILY_QUOTA_COOLDOWN_SEC"); v != "" {
+		if sec, err := strconv.Atoi(v); err == nil {
+			cfg.QuotaCooldownSec = sec
 		}
 	}
 
@@ -123,6 +132,9 @@ func (c *Config) Validate() error {
 	}
 	if c.CooldownSec < 30 {
 		c.CooldownSec = 300 // prevent too aggressive cooldown
+	}
+	if c.QuotaCooldownSec < 60 {
+		c.QuotaCooldownSec = 86400 // minimum 60 seconds for quota cooldown
 	}
 	return nil
 }
@@ -625,24 +637,24 @@ func classifyResponse(resp *http.Response) error {
 		return fmt.Errorf("key disabled: status %d", statusCode)
 	}
 
-	// 432 — Tavily key/plan limit exceeded, permanently disable key
+	// 432 — Tavily key/plan limit exceeded, cooldown key (quotas reset monthly)
 	if statusCode == 432 {
-		rotator.MarkDisabled(key)
+		rotator.MarkCooldown(key, time.Duration(cfg.QuotaCooldownSec)*time.Second)
 		recordMetrics(ErrorTypeAuth)
 		if holder != nil {
 			holder.result = &ClassificationResult{ShouldRetry: true, StatusCode: statusCode}
 		}
-		return fmt.Errorf("key disabled: plan limit exceeded (432)")
+		return fmt.Errorf("key cooldown: plan limit exceeded (432)")
 	}
 
-	// 433 — Tavily PayGo limit exceeded, permanently disable key
+	// 433 — Tavily PayGo limit exceeded, cooldown key (quotas reset monthly)
 	if statusCode == 433 {
-		rotator.MarkDisabled(key)
+		rotator.MarkCooldown(key, time.Duration(cfg.QuotaCooldownSec)*time.Second)
 		recordMetrics(ErrorTypeAuth)
 		if holder != nil {
 			holder.result = &ClassificationResult{ShouldRetry: true, StatusCode: statusCode}
 		}
-		return fmt.Errorf("key disabled: paygo limit exceeded (433)")
+		return fmt.Errorf("key cooldown: paygo limit exceeded (433)")
 	}
 
 	// 429 — rate limit or insufficient quota
@@ -660,12 +672,12 @@ func classifyResponse(resp *http.Response) error {
 			if strings.Contains(detail, "quota") || strings.Contains(detail, "plan limit") ||
 				strings.Contains(detail, "usage limit") || strings.Contains(errMsg, "quota") ||
 				strings.Contains(errMsg, "plan limit") || strings.Contains(errMsg, "usage limit") {
-				rotator.MarkDisabled(key)
+				rotator.MarkCooldown(key, time.Duration(cfg.QuotaCooldownSec)*time.Second)
 				recordMetrics(ErrorTypeAuth)
 				if holder != nil {
 					holder.result = &ClassificationResult{ShouldRetry: true, StatusCode: statusCode}
 				}
-				return fmt.Errorf("key disabled: quota exhausted (429)")
+				return fmt.Errorf("key cooldown: quota exhausted (429)")
 			}
 		}
 
@@ -822,9 +834,14 @@ func healthHandler(w http.ResponseWriter, r *http.Request) {
 		result["upstream"] = "reachable"
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(http.StatusOK)
-	} else if resp.StatusCode == 401 || resp.StatusCode == 403 || resp.StatusCode == 432 || resp.StatusCode == 433 {
+	} else if resp.StatusCode == 401 || resp.StatusCode == 403 {
 		result["status"] = "unhealthy"
 		result["upstream"] = "auth_failed"
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusServiceUnavailable)
+	} else if resp.StatusCode == 432 || resp.StatusCode == 433 {
+		result["status"] = "unhealthy"
+		result["upstream"] = "quota_exhausted"
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(http.StatusServiceUnavailable)
 	} else {

@@ -5,6 +5,7 @@
   "strategy": "least_used",
   "cooldown_sec": 300,
   "max_fails_before_cooldown": 3,
+  "quota_cooldown_sec": 86400,
   "health_check_timeout_seconds": 10,
   "admin_user": "admin",
   "admin_pass": "changeme",

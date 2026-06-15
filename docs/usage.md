@@ -86,6 +86,7 @@ All other values use sensible defaults:
 - Upstream: `https://api.tavily.com`
 - Strategy: `least_used`
 - Cooldown: 300 seconds
+- Quota cooldown: 86400 seconds (24 hours)
 - Max fails before cooldown: 3
 
 ### Production Config with Monitoring
@@ -98,6 +99,7 @@ All other values use sensible defaults:
   "strategy": "least_used",
   "cooldown_sec": 300,
   "max_fails_before_cooldown": 3,
+  "quota_cooldown_sec": 86400,
   "health_check_timeout_seconds": 10,
   "admin_user": "admin",
   "admin_pass": "change-me-in-production",
@@ -117,6 +119,7 @@ docker run -d \
   -e TAVILY_KEYS="tvly-key1,tvly-key2,tvly-key3" \
   -e TAVILY_STRATEGY="round_robin" \
   -e TAVILY_COOLDOWN_SEC="120" \
+  -e TAVILY_QUOTA_COOLDOWN_SEC="86400" \
   tavily-router
 ```
 
@@ -293,11 +296,11 @@ export TAVILY_STRATEGY="round_robin"
 Each key has three possible states:
 
 ```
-HEALTHY ──→ COOLDOWN ──→ (auto-recover after cooldown_sec)
-   │              │
-   │              └──→ HEALTHY (on successful request)
-   │
-   └──→ DISABLED (permanent, requires manual intervention)
+HEALTHY ──→ COOLDOWN ──→ (auto-recover after cooldown_sec or quota_cooldown_sec)
+    │              │
+    │              └──→ HEALTHY (on successful request)
+    │
+    └──→ DISABLED (permanent, 401/403 only — requires manual intervention)
 ```
 
 ### State Transition Rules
@@ -307,7 +310,7 @@ HEALTHY ──→ COOLDOWN ──→ (auto-recover after cooldown_sec)
 | HEALTHY | 2xx response | HEALTHY | — |
 | HEALTHY | 429 rate limit | COOLDOWN | Auto after cooldown |
 | HEALTHY | 401/403 | DISABLED | Never |
-| HEALTHY | 432/433 | DISABLED | Never |
+| HEALTHY | 432/433/429-quota | COOLDOWN | Auto after quota_cooldown_sec (default 24h) |
 | HEALTHY | 5xx (Nth consecutive) | COOLDOWN | Auto after cooldown |
 | HEALTHY | 5xx (below threshold) | HEALTHY | — (fail count increments) |
 | COOLDOWN | Cooldown expires | HEALTHY | Available on next pick |
@@ -384,7 +387,8 @@ Performs a real Tavily search request to verify both key validity and upstream c
 |---|---|
 | `no_healthy_keys` | All keys are in cooldown or disabled |
 | `unreachable` | Tavily API is not responding |
-| `auth_failed` | Key returned 401/403/432/433 |
+| `auth_failed` | Key returned 401/403 (invalid key) |
+| `quota_exhausted` | Key returned 432/433 (quota limit exceeded) |
 | `url_error` | Invalid upstream URL |
 
 **Health check request details**:
@@ -618,9 +622,9 @@ server {
 
 ## Troubleshooting
 
-### All Keys Show as Disabled
+### All Keys Show as Disabled or in Cooldown
 
-This means every key received a 401/403/432/433 response:
+This means every key received a 401/403 response (permanently disabled) or all keys are in quota cooldown (432/433/429-quota):
 
 ```bash
 # Check stats
@@ -628,11 +632,13 @@ curl -u admin:password http://localhost:8082/admin/stats
 ```
 
 Common causes:
-- Invalid API keys
-- Expired keys
-- Plan limits exceeded
+- Invalid API keys (401/403 — permanently disabled)
+- Expired keys (401/403 — permanently disabled)
+- Plan limits exceeded (432/433 — temporary cooldown, auto-recovers)
 
-**Fix**: Replace keys in config and restart, or update `TAVILY_KEYS` environment variable.
+**Fix for 401/403**: Replace keys in config and restart, or update `TAVILY_KEYS` environment variable.
+
+**Fix for 432/433**: Keys will auto-recover after `quota_cooldown_sec` (default 24 hours). Quotas reset monthly.
 
 ### Keys Keep Entering Cooldown
 
@@ -650,7 +656,8 @@ curl http://localhost:8082/health | jq .
 # Check which component failed:
 # "upstream": "no_healthy_keys" → all keys cooldown/disabled
 # "upstream": "unreachable" → Tavily API down
-# "upstream": "auth_failed" → key is invalid
+# "upstream": "auth_failed" → key is invalid (401/403)
+# "upstream": "quota_exhausted" → key quota limit exceeded (432/433)
 ```
 
 ### Request Body Too Large

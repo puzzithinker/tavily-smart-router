@@ -41,7 +41,7 @@ All logic lives in `main.go`. The file is organized into clearly marked sections
 | Consecutive fail tracking | N/A | `max_fails_before_cooldown` (default 3) |
 | Metric prefix | `opencode_router_` | `tavily_router_` |
 | Extra metrics | 4 | 6 (+key_cooldown_total, upstream_errors_total) |
-| Health auth check | Standard | Detects 401/403/432/433 as `auth_failed` |
+| Health auth check | Standard | Detects 401/403 as `auth_failed`, 432/433 as `quota_exhausted` |
 
 ---
 
@@ -78,14 +78,14 @@ Each API key is wrapped in a `KeyEntry` with three possible states:
 | State | Meaning | Transition Trigger |
 |-------|---------|-------------------|
 | `HEALTHY` | Key is available for use | Default state; entered after cooldown expires or on success |
-| `COOLDOWN` | Key is temporarily paused | Entered on 429 rate limit, N consecutive 5xx failures, or timeout |
-| `DISABLED` | Key is permanently removed from rotation | Entered on 401, 403, 432, or 433 |
+| `COOLDOWN` | Key is temporarily paused | Entered on 429 rate limit, N consecutive 5xx failures, timeout, or quota exhaustion (432/433/429-quota) |
+| `DISABLED` | Key is permanently removed from rotation | Entered on 401/403 only |
 
 Transitions:
 
-- `HEALTHY --> COOLDOWN`: Rate limit (429), N consecutive 5xx (via `MarkFail`), or timeout
+- `HEALTHY --> COOLDOWN`: Rate limit (429), N consecutive 5xx (via `MarkFail`), timeout, or quota exhaustion (432/433/429-quota via `MarkCooldown` with `quota_cooldown_sec`)
 - `COOLDOWN --> HEALTHY`: Cooldown period expires (checked at pick time)
-- `HEALTHY --> DISABLED`: Authentication failure (401/403) or Tavily quota limit (432/433)
+- `HEALTHY --> DISABLED`: Authentication failure (401/403) only
 - `COOLDOWN --> DISABLED`: Never happens directly; only via HEALTHY
 - `DISABLED` is permanent — `MarkSuccess()` is a no-op for disabled keys
 
@@ -120,9 +120,9 @@ The `classifyResponse` function maps upstream status codes to actions:
 | 2xx | Forward to client | No | Mark `HEALTHY` |
 | 401 / 403 | Auth failure | Yes (next key) | Mark `DISABLED` |
 | 429 (rate limit) | Rate limited | Yes (next key) | Mark `COOLDOWN` with `Retry-After` |
-| 429 (quota/plan) | Quota exhausted | Yes (next key) | Mark `DISABLED` |
-| 432 | Plan limit exceeded | Yes (next key) | Mark `DISABLED` |
-| 433 | PayGo limit exceeded | Yes (next key) | Mark `DISABLED` |
+| 429 (quota/plan) | Quota exhausted | Yes (next key) | Mark `COOLDOWN` with `quota_cooldown_sec` |
+| 432 | Plan limit exceeded | Yes (next key) | Mark `COOLDOWN` with `quota_cooldown_sec` |
+| 433 | PayGo limit exceeded | Yes (next key) | Mark `COOLDOWN` with `quota_cooldown_sec` |
 | 5xx | Upstream error | No | Track fail (MarkFail) |
 | Timeout | Network issue | No | Mark `COOLDOWN` for 10s |
 | Other 4xx | Client error | No | Track fail (MarkFail) |
@@ -131,12 +131,12 @@ The `classifyResponse` function maps upstream status codes to actions:
 
 For 429 responses, the router parses the response body to distinguish:
 - Regular rate limit → `COOLDOWN`
-- Quota/plan exhaustion (`"quota"`, `"plan limit"`, `"usage limit"` in body) → `DISABLED`
+- Quota/plan exhaustion (`"quota"`, `"plan limit"`, `"usage limit"` in body) → `COOLDOWN` with `quota_cooldown_sec`
 
 ### Tavily-Specific Error Codes
 
-- **432**: Key or plan limit exceeded — the API key has reached its plan's usage limit. Mapped to `DISABLED`.
-- **433**: PayGo limit exceeded — the pay-as-you-go budget is exhausted. Mapped to `DISABLED`.
+- **432**: Key or plan limit exceeded — the API key has reached its plan's usage limit. Mapped to `COOLDOWN` with `quota_cooldown_sec` (default 24h). Quotas reset monthly, so keys auto-recover.
+- **433**: PayGo limit exceeded — the pay-as-you-go budget is exhausted. Mapped to `COOLDOWN` with `quota_cooldown_sec` (default 24h). Quotas reset monthly, so keys auto-recover.
 
 ### Error Type Constants
 
@@ -186,7 +186,8 @@ The `/health` endpoint performs a real `POST /search` request to Tavily with a m
 
 This validates both key validity and upstream connectivity. Response codes:
 - 200 → `healthy` + `reachable`
-- 401/403/432/433 → `unhealthy` + `auth_failed`
+- 401/403 → `unhealthy` + `auth_failed`
+- 432/433 → `unhealthy` + `quota_exhausted`
 - Other errors → `unhealthy` + status code
 
 ---
@@ -207,6 +208,7 @@ Default path is `config.json`. Override with `TAVILY_CONFIG` environment variabl
 | `strategy` | string | `least_used` | `round_robin` or `least_used` |
 | `cooldown_sec` | int | `300` | Default cooldown duration (min 30) |
 | `max_fails_before_cooldown` | int | `3` | Consecutive failures before cooldown (min 1) |
+| `quota_cooldown_sec` | int | `86400` | Cooldown for quota-exhausted keys (432/433/429-quota). Min 60. Quotas reset monthly. |
 | `health_check_timeout_seconds` | int | `10` | Timeout for upstream health probe |
 | `admin_user` | string | `admin` | Basic auth username for admin endpoints |
 | `admin_pass` | string | `""` | Basic auth password. Empty = admin disabled |
@@ -221,6 +223,7 @@ Default path is `config.json`. Override with `TAVILY_CONFIG` environment variabl
 - `TAVILY_LISTEN_ADDR`: Override listen address
 - `TAVILY_STRATEGY`: Override rotation strategy
 - `TAVILY_COOLDOWN_SEC`: Override cooldown seconds
+- `TAVILY_QUOTA_COOLDOWN_SEC`: Override quota cooldown seconds
 - `TAVILY_CONFIG`: Override config file path
 
 ---

@@ -25,6 +25,7 @@ func setupTestGlobals(keys []string, strategy string) {
 		Strategy:                  strategy,
 		CooldownSec:               300,
 		MaxFailsBeforeCooldown:    3,
+		QuotaCooldownSec:          86400,
 		HealthCheckTimeoutSeconds: 10,
 		AdminUser:                 "admin",
 		AdminPass:                 "testpass",
@@ -44,6 +45,7 @@ func setupTestGlobalsNoAuth(keys []string, strategy string) {
 		Strategy:                  strategy,
 		CooldownSec:               300,
 		MaxFailsBeforeCooldown:    3,
+		QuotaCooldownSec:          86400,
 		HealthCheckTimeoutSeconds: 10,
 		AdminUser:                 "admin",
 		AdminPass:                 "",
@@ -966,7 +968,7 @@ func TestTransparentRetry_401AllKeys(t *testing.T) {
 	}
 }
 
-func TestTransparentRetry_432DisablesKey(t *testing.T) {
+func TestTransparentRetry_432CooldownsKey(t *testing.T) {
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(432)
 		w.Write([]byte(`{"detail": "Plan limit exceeded"}`))
@@ -980,6 +982,7 @@ func TestTransparentRetry_432DisablesKey(t *testing.T) {
 		Strategy:               "round_robin",
 		CooldownSec:            300,
 		MaxFailsBeforeCooldown: 3,
+		QuotaCooldownSec:       86400,
 		AdminUser:              "admin",
 		AdminPass:              "testpass",
 		EnablePrometheus:       false,
@@ -996,16 +999,28 @@ func TestTransparentRetry_432DisablesKey(t *testing.T) {
 
 	handler(w, req)
 
-	// Both keys should be disabled after 432
-	if rotator.keys[0].State != KeyDisabled {
-		t.Error("key0 should be disabled after 432")
+	// Both keys should be in cooldown after 432
+	if rotator.keys[0].State != KeyCooldown {
+		t.Error("key0 should be in cooldown after 432")
 	}
-	if rotator.keys[1].State != KeyDisabled {
-		t.Error("key1 should be disabled after 432")
+	if rotator.keys[1].State != KeyCooldown {
+		t.Error("key1 should be in cooldown after 432")
+	}
+
+	// Verify CooldownUntil is set to approximately QuotaCooldownSec in the future
+	for i, key := range rotator.keys {
+		key.mu.Lock()
+		remaining := time.Until(key.CooldownUntil)
+		key.mu.Unlock()
+		minExpected := time.Duration(cfg.QuotaCooldownSec-10) * time.Second
+		maxExpected := time.Duration(cfg.QuotaCooldownSec+10) * time.Second
+		if remaining < minExpected || remaining > maxExpected {
+			t.Errorf("key%d CooldownUntil remaining = %v, want approximately %v", i, remaining, time.Duration(cfg.QuotaCooldownSec)*time.Second)
+		}
 	}
 }
 
-func TestTransparentRetry_433DisablesKey(t *testing.T) {
+func TestTransparentRetry_433CooldownsKey(t *testing.T) {
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(433)
 		w.Write([]byte(`{"detail": "PayGo limit exceeded"}`))
@@ -1019,6 +1034,7 @@ func TestTransparentRetry_433DisablesKey(t *testing.T) {
 		Strategy:               "round_robin",
 		CooldownSec:            300,
 		MaxFailsBeforeCooldown: 3,
+		QuotaCooldownSec:       86400,
 		AdminUser:              "admin",
 		AdminPass:              "testpass",
 		EnablePrometheus:       false,
@@ -1035,12 +1051,24 @@ func TestTransparentRetry_433DisablesKey(t *testing.T) {
 
 	handler(w, req)
 
-	// Both keys should be disabled after 433
-	if rotator.keys[0].State != KeyDisabled {
-		t.Error("key0 should be disabled after 433")
+	// Both keys should be in cooldown after 433
+	if rotator.keys[0].State != KeyCooldown {
+		t.Error("key0 should be in cooldown after 433")
 	}
-	if rotator.keys[1].State != KeyDisabled {
-		t.Error("key1 should be disabled after 433")
+	if rotator.keys[1].State != KeyCooldown {
+		t.Error("key1 should be in cooldown after 433")
+	}
+
+	// Verify CooldownUntil is set to approximately QuotaCooldownSec in the future
+	for i, key := range rotator.keys {
+		key.mu.Lock()
+		remaining := time.Until(key.CooldownUntil)
+		key.mu.Unlock()
+		minExpected := time.Duration(cfg.QuotaCooldownSec-10) * time.Second
+		maxExpected := time.Duration(cfg.QuotaCooldownSec+10) * time.Second
+		if remaining < minExpected || remaining > maxExpected {
+			t.Errorf("key%d CooldownUntil remaining = %v, want approximately %v", i, remaining, time.Duration(cfg.QuotaCooldownSec)*time.Second)
+		}
 	}
 }
 
@@ -1377,12 +1405,22 @@ func TestClassifyResponse_429QuotaExhausted(t *testing.T) {
 	if err == nil {
 		t.Error("classifyResponse() should return error for 429 quota exhausted")
 	}
+	if !strings.Contains(err.Error(), "cooldown") {
+		t.Errorf("error message = %q, want to contain 'cooldown'", err.Error())
+	}
 
 	key.mu.Lock()
-	if key.State != KeyDisabled {
-		t.Errorf("key state = %d, want %d (disabled)", key.State, KeyDisabled)
+	if key.State != KeyCooldown {
+		t.Errorf("key state = %d, want %d (cooldown)", key.State, KeyCooldown)
 	}
+	remaining := time.Until(key.CooldownUntil)
 	key.mu.Unlock()
+
+	minExpected := time.Duration(cfg.QuotaCooldownSec-10) * time.Second
+	maxExpected := time.Duration(cfg.QuotaCooldownSec+10) * time.Second
+	if remaining < minExpected || remaining > maxExpected {
+		t.Errorf("cooldown remaining = %v, want approximately %v", remaining, time.Duration(cfg.QuotaCooldownSec)*time.Second)
+	}
 
 	if holder.result == nil {
 		t.Fatal("holder.result should not be nil")
@@ -1454,12 +1492,22 @@ func TestClassifyResponse_432(t *testing.T) {
 	if err == nil {
 		t.Error("classifyResponse() should return error for 432")
 	}
+	if !strings.Contains(err.Error(), "cooldown") {
+		t.Errorf("error message = %q, want to contain 'cooldown'", err.Error())
+	}
 
 	key.mu.Lock()
-	if key.State != KeyDisabled {
-		t.Errorf("key state = %d, want %d (disabled for 432)", key.State, KeyDisabled)
+	if key.State != KeyCooldown {
+		t.Errorf("key state = %d, want %d (cooldown for 432)", key.State, KeyCooldown)
 	}
+	remaining := time.Until(key.CooldownUntil)
 	key.mu.Unlock()
+
+	minExpected := time.Duration(cfg.QuotaCooldownSec-10) * time.Second
+	maxExpected := time.Duration(cfg.QuotaCooldownSec+10) * time.Second
+	if remaining < minExpected || remaining > maxExpected {
+		t.Errorf("cooldown remaining = %v, want approximately %v", remaining, time.Duration(cfg.QuotaCooldownSec)*time.Second)
+	}
 
 	if holder.result == nil {
 		t.Fatal("holder.result should not be nil")
@@ -1491,12 +1539,22 @@ func TestClassifyResponse_433(t *testing.T) {
 	if err == nil {
 		t.Error("classifyResponse() should return error for 433")
 	}
+	if !strings.Contains(err.Error(), "cooldown") {
+		t.Errorf("error message = %q, want to contain 'cooldown'", err.Error())
+	}
 
 	key.mu.Lock()
-	if key.State != KeyDisabled {
-		t.Errorf("key state = %d, want %d (disabled for 433)", key.State, KeyDisabled)
+	if key.State != KeyCooldown {
+		t.Errorf("key state = %d, want %d (cooldown for 433)", key.State, KeyCooldown)
 	}
+	remaining := time.Until(key.CooldownUntil)
 	key.mu.Unlock()
+
+	minExpected := time.Duration(cfg.QuotaCooldownSec-10) * time.Second
+	maxExpected := time.Duration(cfg.QuotaCooldownSec+10) * time.Second
+	if remaining < minExpected || remaining > maxExpected {
+		t.Errorf("cooldown remaining = %v, want approximately %v", remaining, time.Duration(cfg.QuotaCooldownSec)*time.Second)
+	}
 
 	if holder.result == nil {
 		t.Fatal("holder.result should not be nil")
@@ -1923,6 +1981,16 @@ func TestConfigValidationMinValues(t *testing.T) {
 				return nil
 			},
 		},
+		{
+			"quota_cooldown_below_60_clamped",
+			Config{Keys: []string{"tvly-test"}, Strategy: "round_robin", MaxFailsBeforeCooldown: 1, CooldownSec: 300, QuotaCooldownSec: 30},
+			func(c *Config) error {
+				if c.QuotaCooldownSec != 86400 {
+					return fmt.Errorf("QuotaCooldownSec = %d, want 86400 (min 60)", c.QuotaCooldownSec)
+				}
+				return nil
+			},
+		},
 	}
 
 	for _, tt := range tests {
@@ -2008,8 +2076,8 @@ func TestClassifyResponse_429QuotaInErrorMessage(t *testing.T) {
 	}
 
 	key.mu.Lock()
-	if key.State != KeyDisabled {
-		t.Errorf("key state = %d, want %d (disabled for quota in error message)", key.State, KeyDisabled)
+	if key.State != KeyCooldown {
+		t.Errorf("key state = %d, want %d (cooldown for quota in error message)", key.State, KeyCooldown)
 	}
 	key.mu.Unlock()
 }
@@ -2043,7 +2111,7 @@ func TestLoadConfigEnvOverrideCooldownSec(t *testing.T) {
 
 // --- Integration: Health check detects 432 as auth_failed ---
 
-func TestHealthHandler_432AsAuthFailed(t *testing.T) {
+func TestHealthHandler_432AsQuotaExhausted(t *testing.T) {
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(432)
 		w.Write([]byte(`{"detail": "Plan limit exceeded"}`))
@@ -2057,6 +2125,7 @@ func TestHealthHandler_432AsAuthFailed(t *testing.T) {
 		Strategy:                  "round_robin",
 		CooldownSec:               300,
 		MaxFailsBeforeCooldown:    3,
+		QuotaCooldownSec:          86400,
 		HealthCheckTimeoutSeconds: 5,
 		AdminUser:                 "admin",
 		AdminPass:                 "testpass",
@@ -2078,7 +2147,57 @@ func TestHealthHandler_432AsAuthFailed(t *testing.T) {
 	if err := json.Unmarshal(w.Body.Bytes(), &result); err != nil {
 		t.Fatalf("failed to parse response: %v", err)
 	}
-	if result["upstream"] != "auth_failed" {
-		t.Errorf("upstream = %v, want auth_failed", result["upstream"])
+	if result["upstream"] != "quota_exhausted" {
+		t.Errorf("upstream = %v, want quota_exhausted", result["upstream"])
+	}
+}
+
+// --- Config: TAVILY_QUOTA_COOLDOWN_SEC env override ---
+
+func TestLoadConfigEnvOverrideQuotaCooldownSec(t *testing.T) {
+	tmpFile, err := os.CreateTemp("", "config-*.json")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer os.Remove(tmpFile.Name())
+
+	config := `{"keys": ["tvly-test"], "strategy": "round_robin", "quota_cooldown_sec": 86400}`
+	if _, err := tmpFile.WriteString(config); err != nil {
+		t.Fatal(err)
+	}
+	tmpFile.Close()
+
+	t.Setenv("TAVILY_QUOTA_COOLDOWN_SEC", "3600")
+
+	cfg, err := LoadConfig(tmpFile.Name())
+	if err != nil {
+		t.Fatalf("LoadConfig() error = %v", err)
+	}
+
+	if cfg.QuotaCooldownSec != 3600 {
+		t.Errorf("QuotaCooldownSec = %d, want 3600 (from env override)", cfg.QuotaCooldownSec)
+	}
+}
+
+func TestLoadConfigDefaultQuotaCooldownSec(t *testing.T) {
+	tmpFile, err := os.CreateTemp("", "config-*.json")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer os.Remove(tmpFile.Name())
+
+	config := `{"keys": ["tvly-test"], "strategy": "round_robin"}`
+	if _, err := tmpFile.WriteString(config); err != nil {
+		t.Fatal(err)
+	}
+	tmpFile.Close()
+
+	cfg, err := LoadConfig(tmpFile.Name())
+	if err != nil {
+		t.Fatalf("LoadConfig() error = %v", err)
+	}
+
+	if cfg.QuotaCooldownSec != 86400 {
+		t.Errorf("QuotaCooldownSec = %d, want 86400 (default)", cfg.QuotaCooldownSec)
 	}
 }

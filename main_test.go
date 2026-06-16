@@ -324,19 +324,47 @@ func TestPickKeyRoundRobin(t *testing.T) {
 func TestPickKeyLeastUsed(t *testing.T) {
 	setupTestGlobals([]string{"key0", "key1"}, "least_used")
 
-	key0, _ := rotator.PickKey()
-	if key0.RawKey != "key0" {
-		t.Errorf("first PickKey = %q, want %q", key0.RawKey, "key0")
-	}
-
+	// First pick: both keys tied at count 0, rotation picks one
 	key1, _ := rotator.PickKey()
-	if key1.RawKey != "key1" {
-		t.Errorf("second PickKey = %q, want %q", key1.RawKey, "key1")
+	if key1.RawKey != "key0" && key1.RawKey != "key1" {
+		t.Errorf("first PickKey = %q, want key0 or key1", key1.RawKey)
 	}
 
-	key0Again, _ := rotator.PickKey()
-	if key0Again.RawKey != "key0" {
-		t.Errorf("third PickKey = %q, want %q (tied usage, first wins)", key0Again.RawKey, "key0")
+	// Second pick: the key with lower count wins (the one not picked)
+	key2, _ := rotator.PickKey()
+	if key2.RawKey != "key0" && key2.RawKey != "key1" {
+		t.Errorf("second PickKey = %q, want key0 or key1", key2.RawKey)
+	}
+
+	// Both keys now have count 1, rotation distributes among tied candidates
+	key3, _ := rotator.PickKey()
+	if key3.RawKey != "key0" && key3.RawKey != "key1" {
+		t.Errorf("third PickKey = %q, want key0 or key1", key3.RawKey)
+	}
+}
+
+func TestPickKeyLeastUsedEvenDistribution(t *testing.T) {
+	keys := []string{"key0", "key1", "key2", "key3"}
+	setupTestGlobals(keys, "least_used")
+
+	picks := make(map[string]int)
+	const totalPicks = 40
+	for i := 0; i < totalPicks; i++ {
+		key, err := rotator.PickKey()
+		if err != nil {
+			t.Fatalf("PickKey() error: %v", err)
+		}
+		picks[key.RawKey]++
+	}
+
+	for _, k := range keys {
+		count := picks[k]
+		if count == 0 {
+			t.Errorf("key %q was never picked out of %d total picks", k, totalPicks)
+		}
+		if count > totalPicks/len(keys)+2 {
+			t.Errorf("key %q picked %d times, expected ~%d", k, count, totalPicks/len(keys))
+		}
 	}
 }
 

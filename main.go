@@ -234,13 +234,16 @@ func (kr *KeyRotator) PickKey() (*KeyEntry, error) {
 
 	case "least_used":
 		kr.mu.Lock()
-		var best *KeyEntry
+		var candidates []*KeyEntry
 		var bestCount int64 = -1
 		for _, entry := range kr.keys {
+			entry.mu.Lock()
 			if entry.State == KeyDisabled {
+				entry.mu.Unlock()
 				continue
 			}
 			if entry.State == KeyCooldown && now.Before(entry.CooldownUntil) {
+				entry.mu.Unlock()
 				continue
 			}
 			if entry.State == KeyCooldown {
@@ -249,16 +252,23 @@ func (kr *KeyRotator) PickKey() (*KeyEntry, error) {
 			}
 			if bestCount < 0 || entry.UsageCount < bestCount {
 				bestCount = entry.UsageCount
-				best = entry
+				candidates = []*KeyEntry{entry}
+			} else if entry.UsageCount == bestCount {
+				candidates = append(candidates, entry)
 			}
+			entry.mu.Unlock()
 		}
-		if best == nil {
+		if len(candidates) == 0 {
 			kr.mu.Unlock()
 			return nil, fmt.Errorf("all keys are unavailable")
 		}
+		// Rotate among tied candidates for even distribution
+		best := candidates[int(kr.counter.Add(1))%len(candidates)]
+		best.mu.Lock()
 		best.UsageCount++
 		best.FailCount = 0
 		best.LastUsed = now
+		best.mu.Unlock()
 		kr.mu.Unlock()
 
 		if cfg.EnablePrometheus {

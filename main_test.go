@@ -11,6 +11,7 @@ import (
 	"net/url"
 	"os"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 )
@@ -2227,5 +2228,619 @@ func TestLoadConfigDefaultQuotaCooldownSec(t *testing.T) {
 
 	if cfg.QuotaCooldownSec != 86400 {
 		t.Errorf("QuotaCooldownSec = %d, want 86400 (default)", cfg.QuotaCooldownSec)
+	}
+}
+
+// ============================================================
+// Regression Tests: Bug 1 — least_used tie-breaking bias
+// ============================================================
+
+func TestLeastUsedConcurrentDistribution(t *testing.T) {
+	keys := []string{"key0", "key1", "key2", "key3"}
+	setupTestGlobals(keys, "least_used")
+
+	picks := make(map[string]int)
+	var mu sync.Mutex
+	var wg sync.WaitGroup
+
+	for i := 0; i < 20; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for j := 0; j < 50; j++ {
+				key, err := rotator.PickKey()
+				if err != nil {
+					t.Errorf("PickKey() error: %v", err)
+					return
+				}
+				mu.Lock()
+				picks[key.RawKey]++
+				mu.Unlock()
+			}
+		}()
+	}
+	wg.Wait()
+
+	for _, k := range keys {
+		count := picks[k]
+		if count < 150 {
+			t.Errorf("key %q picked %d times, want at least 150 (of 1000 total)", k, count)
+		}
+		if count > 350 {
+			t.Errorf("key %q picked %d times, want at most 350 (of 1000 total)", k, count)
+		}
+	}
+}
+
+func TestLeastUsedPartialAvailability(t *testing.T) {
+	keys := []string{"key0", "key1", "key2", "key3"}
+	setupTestGlobals(keys, "least_used")
+
+	rotator.MarkDisabled(rotator.keys[0])
+	rotator.MarkDisabled(rotator.keys[1])
+
+	picks := make(map[string]int)
+	for i := 0; i < 100; i++ {
+		key, err := rotator.PickKey()
+		if err != nil {
+			t.Fatalf("PickKey() error: %v", err)
+		}
+		picks[key.RawKey]++
+	}
+
+	for _, k := range []string{"key2", "key3"} {
+		count := picks[k]
+		if count < 35 {
+			t.Errorf("key %q picked %d times, want at least 35", k, count)
+		}
+		if count > 65 {
+			t.Errorf("key %q picked %d times, want at most 65", k, count)
+		}
+	}
+
+	for _, k := range []string{"key0", "key1"} {
+		if picks[k] != 0 {
+			t.Errorf("disabled key %q picked %d times, want 0", k, picks[k])
+		}
+	}
+}
+
+func TestLeastUsedRecoveredKeyGetsPriority(t *testing.T) {
+	keys := []string{"key0", "key1", "key2"}
+	setupTestGlobals(keys, "least_used")
+
+	for i := 0; i < 5; i++ {
+		key, err := rotator.PickKey()
+		if err != nil {
+			t.Fatalf("PickKey() error: %v", err)
+		}
+		if key.RawKey != "key0" {
+			// Force key0 to be picked 5 times by re-picking if needed
+			// Since least_used distributes evenly, we need to manually advance UsageCount
+		}
+	}
+
+	// Manually advance key0's UsageCount to simulate it being heavily used
+	rotator.keys[0].mu.Lock()
+	rotator.keys[0].UsageCount = 5
+	rotator.keys[0].mu.Unlock()
+
+	picks := make(map[string]int)
+	for i := 0; i < 10; i++ {
+		key, err := rotator.PickKey()
+		if err != nil {
+			t.Fatalf("PickKey() error: %v", err)
+		}
+		picks[key.RawKey]++
+	}
+
+	key0Picks := picks["key0"]
+	key1Picks := picks["key1"]
+	key2Picks := picks["key2"]
+
+	if key1Picks <= key0Picks {
+		t.Errorf("key1 picks (%d) should be > key0 picks (%d) since key0 has higher usage", key1Picks, key0Picks)
+	}
+	if key2Picks <= key0Picks {
+		t.Errorf("key2 picks (%d) should be > key0 picks (%d) since key0 has higher usage", key2Picks, key0Picks)
+	}
+}
+
+func TestLeastUsedAfterCooldownRecoveryDistribution(t *testing.T) {
+	keys := []string{"key0", "key1", "key2", "key3"}
+	setupTestGlobals(keys, "least_used")
+
+	// Put key0 in cooldown for 10 seconds
+	rotator.MarkCooldown(rotator.keys[0], 10*time.Second)
+
+	// Pick 4 times while key0 is cooling down — key1, key2, key3 each get picks
+	for i := 0; i < 4; i++ {
+		_, err := rotator.PickKey()
+		if err != nil {
+			t.Fatalf("PickKey() error: %v", err)
+		}
+	}
+
+	// Expire key0's cooldown
+	rotator.keys[0].mu.Lock()
+	rotator.keys[0].CooldownUntil = time.Now().Add(-time.Second)
+	rotator.keys[0].mu.Unlock()
+
+	// Do 4 more picks — key0 should get picked because it has lower UsageCount
+	key0Picks := 0
+	for i := 0; i < 4; i++ {
+		key, err := rotator.PickKey()
+		if err != nil {
+			t.Fatalf("PickKey() error: %v", err)
+		}
+		if key.RawKey == "key0" {
+			key0Picks++
+		}
+	}
+
+	if key0Picks == 0 {
+		t.Error("key0 was never picked after cooldown recovery, expected at least 1 pick (lower UsageCount)")
+	}
+}
+
+// ============================================================
+// Regression Tests: Bug 2 — Quota cooldown (not permanent disable)
+// ============================================================
+
+func TestQuotaCooldown432AutoRecovers(t *testing.T) {
+	callCount := 0
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		callCount++
+		if callCount == 1 {
+			w.WriteHeader(432)
+			w.Write([]byte(`{"detail": "Plan limit exceeded"}`))
+			return
+		}
+		w.WriteHeader(http.StatusOK)
+		w.Write([]byte(`{"results":[]}`))
+	}))
+	defer upstream.Close()
+
+	upstreamURL, _ := url.Parse(upstream.URL)
+	cfg = &Config{
+		UpstreamBase:           upstreamURL.String(),
+		Keys:                   []string{"key0"},
+		Strategy:               "round_robin",
+		CooldownSec:            300,
+		MaxFailsBeforeCooldown: 3,
+		QuotaCooldownSec:       86400,
+		AdminUser:              "admin",
+		AdminPass:              "testpass",
+		EnablePrometheus:       false,
+	}
+	rotator = NewKeyRotator([]string{"key0"}, "round_robin")
+	slog.SetDefault(slog.New(slog.NewTextHandler(io.Discard, nil)))
+
+	rp := newReverseProxy(upstreamURL)
+	handler := proxyHandler(rp, rotator)
+
+	req := httptest.NewRequest("POST", "/search", strings.NewReader(`{"query":"test"}`))
+	req.Header.Set("Content-Type", "application/json")
+	w := httptest.NewRecorder()
+
+	handler(w, req)
+
+	// (a) key0 should be in KeyCooldown, NOT KeyDisabled
+	rotator.keys[0].mu.Lock()
+	if rotator.keys[0].State != KeyCooldown {
+		t.Errorf("key0 State = %d, want %d (KeyCooldown, not KeyDisabled)", rotator.keys[0].State, KeyCooldown)
+	}
+	remaining := time.Until(rotator.keys[0].CooldownUntil)
+	rotator.keys[0].mu.Unlock()
+
+	// (b) CooldownUntil should be approximately QuotaCooldownSec in the future
+	minExpected := time.Duration(cfg.QuotaCooldownSec-10) * time.Second
+	maxExpected := time.Duration(cfg.QuotaCooldownSec+10) * time.Second
+	if remaining < minExpected || remaining > maxExpected {
+		t.Errorf("cooldown remaining = %v, want approximately %v", remaining, time.Duration(cfg.QuotaCooldownSec)*time.Second)
+	}
+
+	// Expire the cooldown
+	rotator.keys[0].mu.Lock()
+	rotator.keys[0].CooldownUntil = time.Now().Add(-time.Second)
+	rotator.keys[0].mu.Unlock()
+
+	// Send another request — should succeed
+	req2 := httptest.NewRequest("POST", "/search", strings.NewReader(`{"query":"test"}`))
+	req2.Header.Set("Content-Type", "application/json")
+	w2 := httptest.NewRecorder()
+
+	handler(w2, req2)
+
+	if w2.Code != http.StatusOK {
+		t.Errorf("second request status = %d, want %d (should succeed after cooldown expiry)", w2.Code, http.StatusOK)
+	}
+
+	rotator.keys[0].mu.Lock()
+	if rotator.keys[0].State != KeyHealthy {
+		t.Errorf("key0 State after recovery = %d, want %d (KeyHealthy)", rotator.keys[0].State, KeyHealthy)
+	}
+	rotator.keys[0].mu.Unlock()
+}
+
+func TestQuotaCooldown433AutoRecovers(t *testing.T) {
+	callCount := 0
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		callCount++
+		if callCount == 1 {
+			w.WriteHeader(433)
+			w.Write([]byte(`{"detail": "PayGo limit exceeded"}`))
+			return
+		}
+		w.WriteHeader(http.StatusOK)
+		w.Write([]byte(`{"results":[]}`))
+	}))
+	defer upstream.Close()
+
+	upstreamURL, _ := url.Parse(upstream.URL)
+	cfg = &Config{
+		UpstreamBase:           upstreamURL.String(),
+		Keys:                   []string{"key0"},
+		Strategy:               "round_robin",
+		CooldownSec:            300,
+		MaxFailsBeforeCooldown: 3,
+		QuotaCooldownSec:       86400,
+		AdminUser:              "admin",
+		AdminPass:              "testpass",
+		EnablePrometheus:       false,
+	}
+	rotator = NewKeyRotator([]string{"key0"}, "round_robin")
+	slog.SetDefault(slog.New(slog.NewTextHandler(io.Discard, nil)))
+
+	rp := newReverseProxy(upstreamURL)
+	handler := proxyHandler(rp, rotator)
+
+	req := httptest.NewRequest("POST", "/search", strings.NewReader(`{"query":"test"}`))
+	req.Header.Set("Content-Type", "application/json")
+	w := httptest.NewRecorder()
+
+	handler(w, req)
+
+	rotator.keys[0].mu.Lock()
+	if rotator.keys[0].State != KeyCooldown {
+		t.Errorf("key0 State = %d, want %d (KeyCooldown for 433)", rotator.keys[0].State, KeyCooldown)
+	}
+	remaining := time.Until(rotator.keys[0].CooldownUntil)
+	rotator.keys[0].mu.Unlock()
+
+	minExpected := time.Duration(cfg.QuotaCooldownSec-10) * time.Second
+	maxExpected := time.Duration(cfg.QuotaCooldownSec+10) * time.Second
+	if remaining < minExpected || remaining > maxExpected {
+		t.Errorf("cooldown remaining = %v, want approximately %v", remaining, time.Duration(cfg.QuotaCooldownSec)*time.Second)
+	}
+
+	// Expire the cooldown
+	rotator.keys[0].mu.Lock()
+	rotator.keys[0].CooldownUntil = time.Now().Add(-time.Second)
+	rotator.keys[0].mu.Unlock()
+
+	req2 := httptest.NewRequest("POST", "/search", strings.NewReader(`{"query":"test"}`))
+	req2.Header.Set("Content-Type", "application/json")
+	w2 := httptest.NewRecorder()
+
+	handler(w2, req2)
+
+	if w2.Code != http.StatusOK {
+		t.Errorf("second request status = %d, want %d (should succeed after cooldown expiry)", w2.Code, http.StatusOK)
+	}
+
+	rotator.keys[0].mu.Lock()
+	if rotator.keys[0].State != KeyHealthy {
+		t.Errorf("key0 State after recovery = %d, want %d (KeyHealthy)", rotator.keys[0].State, KeyHealthy)
+	}
+	rotator.keys[0].mu.Unlock()
+}
+
+func TestQuotaCooldown429QuotaAutoRecovers(t *testing.T) {
+	callCount := 0
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		callCount++
+		if callCount == 1 {
+			w.WriteHeader(http.StatusTooManyRequests)
+			w.Write([]byte(`{"detail": "Usage limit exceeded for the plan"}`))
+			return
+		}
+		w.WriteHeader(http.StatusOK)
+		w.Write([]byte(`{"results":[]}`))
+	}))
+	defer upstream.Close()
+
+	upstreamURL, _ := url.Parse(upstream.URL)
+	cfg = &Config{
+		UpstreamBase:           upstreamURL.String(),
+		Keys:                   []string{"key0"},
+		Strategy:               "round_robin",
+		CooldownSec:            300,
+		MaxFailsBeforeCooldown: 3,
+		QuotaCooldownSec:       86400,
+		AdminUser:              "admin",
+		AdminPass:              "testpass",
+		EnablePrometheus:       false,
+	}
+	rotator = NewKeyRotator([]string{"key0"}, "round_robin")
+	slog.SetDefault(slog.New(slog.NewTextHandler(io.Discard, nil)))
+
+	rp := newReverseProxy(upstreamURL)
+	handler := proxyHandler(rp, rotator)
+
+	req := httptest.NewRequest("POST", "/search", strings.NewReader(`{"query":"test"}`))
+	req.Header.Set("Content-Type", "application/json")
+	w := httptest.NewRecorder()
+
+	handler(w, req)
+
+	rotator.keys[0].mu.Lock()
+	if rotator.keys[0].State != KeyCooldown {
+		t.Errorf("key0 State = %d, want %d (KeyCooldown for 429-quota)", rotator.keys[0].State, KeyCooldown)
+	}
+	remaining := time.Until(rotator.keys[0].CooldownUntil)
+	rotator.keys[0].mu.Unlock()
+
+	minExpected := time.Duration(cfg.QuotaCooldownSec-10) * time.Second
+	maxExpected := time.Duration(cfg.QuotaCooldownSec+10) * time.Second
+	if remaining < minExpected || remaining > maxExpected {
+		t.Errorf("cooldown remaining = %v, want approximately %v", remaining, time.Duration(cfg.QuotaCooldownSec)*time.Second)
+	}
+
+	// Expire the cooldown
+	rotator.keys[0].mu.Lock()
+	rotator.keys[0].CooldownUntil = time.Now().Add(-time.Second)
+	rotator.keys[0].mu.Unlock()
+
+	req2 := httptest.NewRequest("POST", "/search", strings.NewReader(`{"query":"test"}`))
+	req2.Header.Set("Content-Type", "application/json")
+	w2 := httptest.NewRecorder()
+
+	handler(w2, req2)
+
+	if w2.Code != http.StatusOK {
+		t.Errorf("second request status = %d, want %d (should succeed after cooldown expiry)", w2.Code, http.StatusOK)
+	}
+
+	rotator.keys[0].mu.Lock()
+	if rotator.keys[0].State != KeyHealthy {
+		t.Errorf("key0 State after recovery = %d, want %d (KeyHealthy)", rotator.keys[0].State, KeyHealthy)
+	}
+	rotator.keys[0].mu.Unlock()
+}
+
+func TestAuth401StillPermanentDisable(t *testing.T) {
+	setupTestGlobals([]string{"key0"}, "round_robin")
+
+	key := rotator.keys[0]
+	holder := &classifyHolder{}
+
+	req := httptest.NewRequest("POST", "/search", nil)
+	ctx := context.WithValue(req.Context(), keyCtxKey, key)
+	ctx = context.WithValue(ctx, classifyCtxKey, holder)
+	ctx = context.WithValue(ctx, startTimeCtxKey, time.Now())
+	req = req.WithContext(ctx)
+
+	resp := &http.Response{
+		StatusCode: 401,
+		Request:    req,
+		Body:       io.NopCloser(strings.NewReader("")),
+	}
+
+	classifyResponse(resp)
+
+	key.mu.Lock()
+	if key.State != KeyDisabled {
+		t.Errorf("key State after 401 = %d, want %d (KeyDisabled, NOT KeyCooldown)", key.State, KeyDisabled)
+	}
+	key.mu.Unlock()
+
+	// MarkSuccess should NOT recover a disabled key
+	rotator.MarkSuccess(key)
+
+	key.mu.Lock()
+	if key.State != KeyDisabled {
+		t.Errorf("key State after MarkSuccess = %d, want %d (should stay KeyDisabled)", key.State, KeyDisabled)
+	}
+	key.mu.Unlock()
+}
+
+func TestAuth403StillPermanentDisable(t *testing.T) {
+	setupTestGlobals([]string{"key0"}, "round_robin")
+
+	key := rotator.keys[0]
+	holder := &classifyHolder{}
+
+	req := httptest.NewRequest("POST", "/search", nil)
+	ctx := context.WithValue(req.Context(), keyCtxKey, key)
+	ctx = context.WithValue(ctx, classifyCtxKey, holder)
+	ctx = context.WithValue(ctx, startTimeCtxKey, time.Now())
+	req = req.WithContext(ctx)
+
+	resp := &http.Response{
+		StatusCode: 403,
+		Request:    req,
+		Body:       io.NopCloser(strings.NewReader("")),
+	}
+
+	classifyResponse(resp)
+
+	key.mu.Lock()
+	if key.State != KeyDisabled {
+		t.Errorf("key State after 403 = %d, want %d (KeyDisabled, NOT KeyCooldown)", key.State, KeyDisabled)
+	}
+	key.mu.Unlock()
+
+	rotator.MarkSuccess(key)
+
+	key.mu.Lock()
+	if key.State != KeyDisabled {
+		t.Errorf("key State after MarkSuccess = %d, want %d (should stay KeyDisabled)", key.State, KeyDisabled)
+	}
+	key.mu.Unlock()
+}
+
+func TestMixedQuotaAndRateLimit(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		auth := r.Header.Get("Authorization")
+		if auth == "Bearer key0" {
+			w.WriteHeader(432)
+			w.Write([]byte(`{"detail": "Plan limit exceeded"}`))
+			return
+		}
+		w.WriteHeader(http.StatusTooManyRequests)
+		w.Write([]byte(`{"detail": "Rate limit exceeded"}`))
+	}))
+	defer upstream.Close()
+
+	upstreamURL, _ := url.Parse(upstream.URL)
+	cfg = &Config{
+		UpstreamBase:           upstreamURL.String(),
+		Keys:                   []string{"key0", "key1"},
+		Strategy:               "round_robin",
+		CooldownSec:            300,
+		MaxFailsBeforeCooldown: 3,
+		QuotaCooldownSec:       86400,
+		AdminUser:              "admin",
+		AdminPass:              "testpass",
+		EnablePrometheus:       false,
+	}
+	rotator = NewKeyRotator([]string{"key0", "key1"}, "round_robin")
+	slog.SetDefault(slog.New(slog.NewTextHandler(io.Discard, nil)))
+
+	rp := newReverseProxy(upstreamURL)
+	handler := proxyHandler(rp, rotator)
+
+	req := httptest.NewRequest("POST", "/search", strings.NewReader(`{"query":"test"}`))
+	req.Header.Set("Content-Type", "application/json")
+	w := httptest.NewRecorder()
+
+	handler(w, req)
+
+	// key0 should be in KeyCooldown with QuotaCooldownSec duration (86400)
+	rotator.keys[0].mu.Lock()
+	if rotator.keys[0].State != KeyCooldown {
+		t.Errorf("key0 State = %d, want %d (KeyCooldown for 432)", rotator.keys[0].State, KeyCooldown)
+	}
+	key0Remaining := time.Until(rotator.keys[0].CooldownUntil)
+	rotator.keys[0].mu.Unlock()
+
+	// key1 should be in KeyCooldown with default CooldownSec duration (300)
+	rotator.keys[1].mu.Lock()
+	if rotator.keys[1].State != KeyCooldown {
+		t.Errorf("key1 State = %d, want %d (KeyCooldown for 429)", rotator.keys[1].State, KeyCooldown)
+	}
+	key1Remaining := time.Until(rotator.keys[1].CooldownUntil)
+	rotator.keys[1].mu.Unlock()
+
+	// The two cooldown durations should be significantly different
+	// QuotaCooldownSec=86400 vs CooldownSec=300
+	diff := key0Remaining - key1Remaining
+	if diff < 80000*time.Second {
+		t.Errorf("cooldown duration difference = %v, key0 remaining = %v, key1 remaining = %v; quota cooldown should be much longer than rate limit cooldown", diff, key0Remaining, key1Remaining)
+	}
+}
+
+func TestQuotaCooldownConfigOverride(t *testing.T) {
+	setupTestGlobals([]string{"key0"}, "round_robin")
+	cfg.QuotaCooldownSec = 3600
+
+	key := rotator.keys[0]
+	holder := &classifyHolder{}
+
+	req := httptest.NewRequest("POST", "/search", nil)
+	ctx := context.WithValue(req.Context(), keyCtxKey, key)
+	ctx = context.WithValue(ctx, classifyCtxKey, holder)
+	ctx = context.WithValue(ctx, startTimeCtxKey, time.Now())
+	req = req.WithContext(ctx)
+
+	resp := &http.Response{
+		StatusCode: 432,
+		Request:    req,
+		Body:       io.NopCloser(strings.NewReader("")),
+	}
+
+	classifyResponse(resp)
+
+	key.mu.Lock()
+	remaining := time.Until(key.CooldownUntil)
+	key.mu.Unlock()
+
+	minExpected := time.Duration(3600-10) * time.Second
+	maxExpected := time.Duration(3600+10) * time.Second
+	if remaining < minExpected || remaining > maxExpected {
+		t.Errorf("cooldown remaining = %v, want approximately 3600s (config override), not 86400s", remaining)
+	}
+}
+
+func TestHealthCheckDistinguishesQuotaFromAuth(t *testing.T) {
+	// Test 432 → quota_exhausted
+	upstream432 := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(432)
+		w.Write([]byte(`{"detail": "Plan limit exceeded"}`))
+	}))
+	defer upstream432.Close()
+
+	upstreamURL432, _ := url.Parse(upstream432.URL)
+	cfg = &Config{
+		UpstreamBase:              upstreamURL432.String(),
+		Keys:                      []string{"key0"},
+		Strategy:                  "round_robin",
+		CooldownSec:               300,
+		MaxFailsBeforeCooldown:    3,
+		QuotaCooldownSec:          86400,
+		HealthCheckTimeoutSeconds: 5,
+		AdminUser:                 "admin",
+		AdminPass:                 "testpass",
+		EnablePrometheus:          false,
+	}
+	rotator = NewKeyRotator([]string{"key0"}, "round_robin")
+	slog.SetDefault(slog.New(slog.NewTextHandler(io.Discard, nil)))
+
+	req := httptest.NewRequest("GET", "/health", nil)
+	w := httptest.NewRecorder()
+	healthHandler(w, req)
+
+	var result432 map[string]interface{}
+	if err := json.Unmarshal(w.Body.Bytes(), &result432); err != nil {
+		t.Fatalf("failed to parse 432 response: %v", err)
+	}
+	if result432["upstream"] != "quota_exhausted" {
+		t.Errorf("432 upstream = %v, want quota_exhausted (NOT auth_failed)", result432["upstream"])
+	}
+
+	// Test 401 → auth_failed
+	upstream401 := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusUnauthorized)
+		w.Write([]byte(`{"error": "Invalid API key"}`))
+	}))
+	defer upstream401.Close()
+
+	upstreamURL401, _ := url.Parse(upstream401.URL)
+	cfg = &Config{
+		UpstreamBase:              upstreamURL401.String(),
+		Keys:                      []string{"key0"},
+		Strategy:                  "round_robin",
+		CooldownSec:               300,
+		MaxFailsBeforeCooldown:    3,
+		QuotaCooldownSec:          86400,
+		HealthCheckTimeoutSeconds: 5,
+		AdminUser:                 "admin",
+		AdminPass:                 "testpass",
+		EnablePrometheus:          false,
+	}
+	rotator = NewKeyRotator([]string{"key0"}, "round_robin")
+	slog.SetDefault(slog.New(slog.NewTextHandler(io.Discard, nil)))
+
+	req2 := httptest.NewRequest("GET", "/health", nil)
+	w2 := httptest.NewRecorder()
+	healthHandler(w2, req2)
+
+	var result401 map[string]interface{}
+	if err := json.Unmarshal(w2.Body.Bytes(), &result401); err != nil {
+		t.Fatalf("failed to parse 401 response: %v", err)
+	}
+	if result401["upstream"] != "auth_failed" {
+		t.Errorf("401 upstream = %v, want auth_failed (NOT quota_exhausted)", result401["upstream"])
 	}
 }

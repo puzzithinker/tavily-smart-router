@@ -1758,9 +1758,17 @@ func TestPickKeyLeastUsedAfterCooldown(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if key.RawKey != "key0" {
-		t.Errorf("PickKey = %q, want %q (cooldown expired, should be available)", key.RawKey, "key0")
+	// After normalization, recovering key's UsageCount matches baseline (key1's count).
+	// Both keys are tied, so either can be picked. Verify key0 is available.
+	if key.RawKey != "key0" && key.RawKey != "key1" {
+		t.Errorf("PickKey = %q, want key0 or key1 (cooldown expired, key0 should be available)", key.RawKey)
 	}
+	// Verify key0's UsageCount was normalized to prevent thundering herd
+	rotator.keys[0].mu.Lock()
+	if rotator.keys[0].UsageCount < 1 {
+		t.Errorf("key0 UsageCount = %d, want >= 1 (should be normalized to baseline after cooldown recovery)", rotator.keys[0].UsageCount)
+	}
+	rotator.keys[0].mu.Unlock()
 }
 
 func TestPickKeySingleKeyDisabled(t *testing.T) {
@@ -2350,10 +2358,9 @@ func TestLeastUsedAfterCooldownRecoveryDistribution(t *testing.T) {
 	keys := []string{"key0", "key1", "key2", "key3"}
 	setupTestGlobals(keys, "least_used")
 
-	// Put key0 in cooldown for 10 seconds
 	rotator.MarkCooldown(rotator.keys[0], 10*time.Second)
 
-	// Pick 4 times while key0 is cooling down — key1, key2, key3 each get picks
+	// Pick 4 times while key0 is cooling down
 	for i := 0; i < 4; i++ {
 		_, err := rotator.PickKey()
 		if err != nil {
@@ -2366,21 +2373,69 @@ func TestLeastUsedAfterCooldownRecoveryDistribution(t *testing.T) {
 	rotator.keys[0].CooldownUntil = time.Now().Add(-time.Second)
 	rotator.keys[0].mu.Unlock()
 
-	// Do 4 more picks — key0 should get picked because it has lower UsageCount
-	key0Picks := 0
-	for i := 0; i < 4; i++ {
+	// After normalization, key0's UsageCount matches the baseline.
+	// Distribution should be fair — key0 should get picks and no single key should dominate.
+	picks := make(map[string]int)
+	for i := 0; i < 20; i++ {
 		key, err := rotator.PickKey()
 		if err != nil {
 			t.Fatalf("PickKey() error: %v", err)
 		}
-		if key.RawKey == "key0" {
-			key0Picks++
-		}
+		picks[key.RawKey]++
 	}
 
-	if key0Picks == 0 {
-		t.Error("key0 was never picked after cooldown recovery, expected at least 1 pick (lower UsageCount)")
+	if picks["key0"] == 0 {
+		t.Error("key0 was never picked after cooldown recovery — distribution unfair")
 	}
+
+	// Verify no single key gets more than 60% of picks (prevents thundering herd)
+	for _, k := range keys {
+		if picks[k] > 12 {
+			t.Errorf("key %q picked %d times out of 20 — possible thundering herd", k, picks[k])
+		}
+	}
+}
+
+func TestLeastUsedThunderingHerdPrevention(t *testing.T) {
+	keys := []string{"key0", "key1"}
+	setupTestGlobals(keys, "least_used")
+
+	// Simulate: key1 handled many requests while key0 was in cooldown
+	rotator.keys[1].mu.Lock()
+	rotator.keys[1].UsageCount = 100
+	rotator.keys[1].mu.Unlock()
+
+	// key0 in cooldown, expired
+	rotator.keys[0].mu.Lock()
+	rotator.keys[0].State = KeyCooldown
+	rotator.keys[0].CooldownUntil = time.Now().Add(-time.Second)
+	rotator.keys[0].mu.Unlock()
+
+	// Without normalization: key0.UsageCount=0 < key1.UsageCount=100 → ALL traffic floods key0
+	// With normalization: key0.UsageCount=100 (matched to baseline) → fair distribution
+
+	picks := make(map[string]int)
+	for i := 0; i < 20; i++ {
+		key, err := rotator.PickKey()
+		if err != nil {
+			t.Fatalf("PickKey() error: %v", err)
+		}
+		picks[key.RawKey]++
+	}
+
+	if picks["key0"] == 0 {
+		t.Error("key0 was never picked after recovery — possible thundering herd skew")
+	}
+	if picks["key1"] == 0 {
+		t.Error("key1 was never picked after recovery — unexpected distribution")
+	}
+
+	// Verify key0's UsageCount was normalized to match the baseline
+	rotator.keys[0].mu.Lock()
+	if rotator.keys[0].UsageCount < 100 {
+		t.Errorf("key0 UsageCount = %d, want >= 100 (should be normalized to baseline after cooldown recovery)", rotator.keys[0].UsageCount)
+	}
+	rotator.keys[0].mu.Unlock()
 }
 
 // ============================================================

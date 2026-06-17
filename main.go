@@ -234,6 +234,30 @@ func (kr *KeyRotator) PickKey() (*KeyEntry, error) {
 
 	case "least_used":
 		kr.mu.Lock()
+
+		// First pass: compute baseline UsageCount for normalizing recovering keys.
+		// When a key recovers from cooldown, its UsageCount is much lower than keys
+		// that handled traffic during the cooldown. Without normalization, ALL
+		// requests would flood the recovering key (thundering herd), potentially
+		// triggering another rate limit and creating oscillation.
+		var baselineUsage int64
+		for _, entry := range kr.keys {
+			entry.mu.Lock()
+			if entry.State == KeyDisabled {
+				entry.mu.Unlock()
+				continue
+			}
+			if entry.State == KeyCooldown && now.Before(entry.CooldownUntil) {
+				entry.mu.Unlock()
+				continue
+			}
+			if entry.UsageCount > baselineUsage {
+				baselineUsage = entry.UsageCount
+			}
+			entry.mu.Unlock()
+		}
+
+		// Second pass: build candidates with cooldown normalization
 		var candidates []*KeyEntry
 		var bestCount int64 = -1
 		for _, entry := range kr.keys {
@@ -249,6 +273,8 @@ func (kr *KeyRotator) PickKey() (*KeyEntry, error) {
 			if entry.State == KeyCooldown {
 				entry.State = KeyHealthy
 				entry.CooldownUntil = time.Time{}
+				// Normalize usage to prevent thundering herd on recovery
+				entry.UsageCount = baselineUsage
 			}
 			if bestCount < 0 || entry.UsageCount < bestCount {
 				bestCount = entry.UsageCount

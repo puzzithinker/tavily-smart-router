@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"math"
 	"net/http"
 	"net/http/httputil"
 	"net/url"
@@ -405,6 +406,56 @@ func (kr *KeyRotator) DisabledCount() int {
 	return count
 }
 
+func (kr *KeyRotator) EnableKey(index int) error {
+	if index < 0 || index >= len(kr.keys) {
+		return fmt.Errorf("key index %d out of range (0-%d)", index, len(kr.keys)-1)
+	}
+	entry := kr.keys[index]
+	entry.mu.Lock()
+	entry.State = KeyHealthy
+	entry.CooldownUntil = time.Time{}
+	entry.FailCount = 0
+	entry.mu.Unlock()
+
+	if cfg.EnablePrometheus {
+		keyHealthy.WithLabelValues(entry.Key).Set(1)
+	}
+
+	slog.Info("key_manually_enabled", "key", entry.Key, "index", index)
+	return nil
+}
+
+func (kr *KeyRotator) DisableKey(index int) error {
+	if index < 0 || index >= len(kr.keys) {
+		return fmt.Errorf("key index %d out of range (0-%d)", index, len(kr.keys)-1)
+	}
+	entry := kr.keys[index]
+	entry.mu.Lock()
+	entry.State = KeyDisabled
+	entry.mu.Unlock()
+
+	if cfg.EnablePrometheus {
+		keyHealthy.WithLabelValues(entry.Key).Set(0)
+	}
+
+	slog.Info("key_manually_disabled", "key", entry.Key, "index", index)
+	return nil
+}
+
+func (kr *KeyRotator) ResetKeyStats(index int) error {
+	if index < 0 || index >= len(kr.keys) {
+		return fmt.Errorf("key index %d out of range (0-%d)", index, len(kr.keys)-1)
+	}
+	entry := kr.keys[index]
+	entry.mu.Lock()
+	entry.UsageCount = 0
+	entry.FailCount = 0
+	entry.mu.Unlock()
+
+	slog.Info("key_stats_reset", "key", entry.Key, "index", index)
+	return nil
+}
+
 func MaskKey(key string) string {
 	l := len(key)
 	if l > 8 {
@@ -794,18 +845,9 @@ func healthHandler(w http.ResponseWriter, r *http.Request) {
 		Timeout: time.Duration(cfg.HealthCheckTimeoutSeconds) * time.Second,
 	}
 
-	// Try to find a healthy key
-	var key *KeyEntry
-	now := time.Now()
-	for _, entry := range rotator.keys {
-		entry.mu.Lock()
-		if entry.State == KeyHealthy || (entry.State == KeyCooldown && !now.Before(entry.CooldownUntil)) {
-			key = entry
-			entry.mu.Unlock()
-			break
-		}
-		entry.mu.Unlock()
-	}
+	// Use PickKey() to rotate health checks across keys — avoids
+	// always hitting the first key in the slice and biasing its quota usage.
+	key, err := rotator.PickKey()
 
 	result := map[string]interface{}{
 		"healthy_keys":  rotator.HealthyCount(),
@@ -813,7 +855,7 @@ func healthHandler(w http.ResponseWriter, r *http.Request) {
 		"disabled_keys": rotator.DisabledCount(),
 	}
 
-	if key == nil {
+	if err != nil {
 		result["status"] = "unhealthy"
 		result["upstream"] = "no_healthy_keys"
 		w.Header().Set("Content-Type", "application/json")
@@ -821,6 +863,8 @@ func healthHandler(w http.ResponseWriter, r *http.Request) {
 		json.NewEncoder(w).Encode(result) //nolint:errcheck
 		return
 	}
+
+	result["key"] = key.Key
 
 	// Perform a lightweight Tavily search to verify upstream connectivity
 	upstreamURL, _ := url.Parse(cfg.UpstreamBase)
@@ -856,6 +900,7 @@ func healthHandler(w http.ResponseWriter, r *http.Request) {
 
 	resp, err := client.Do(req)
 	if err != nil {
+		rotator.MarkFail(key)
 		result["status"] = "unhealthy"
 		result["upstream"] = "unreachable"
 		w.Header().Set("Content-Type", "application/json")
@@ -866,21 +911,32 @@ func healthHandler(w http.ResponseWriter, r *http.Request) {
 	defer resp.Body.Close()
 
 	if resp.StatusCode >= 200 && resp.StatusCode < 300 {
+		rotator.MarkSuccess(key)
 		result["status"] = "healthy"
 		result["upstream"] = "reachable"
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(http.StatusOK)
 	} else if resp.StatusCode == 401 || resp.StatusCode == 403 {
+		rotator.MarkDisabled(key)
 		result["status"] = "unhealthy"
 		result["upstream"] = "auth_failed"
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(http.StatusServiceUnavailable)
 	} else if resp.StatusCode == 432 || resp.StatusCode == 433 {
+		rotator.MarkCooldown(key, time.Duration(cfg.QuotaCooldownSec)*time.Second)
 		result["status"] = "unhealthy"
 		result["upstream"] = "quota_exhausted"
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(http.StatusServiceUnavailable)
+	} else if resp.StatusCode == 429 {
+		retryAfter := ParseRetryAfter(resp.Header.Get("Retry-After"), time.Duration(cfg.CooldownSec)*time.Second)
+		rotator.MarkCooldown(key, retryAfter)
+		result["status"] = "unhealthy"
+		result["upstream"] = "rate_limited"
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusServiceUnavailable)
 	} else {
+		rotator.MarkFail(key)
 		result["status"] = "unhealthy"
 		result["upstream"] = fmt.Sprintf("http_%d", resp.StatusCode)
 		w.Header().Set("Content-Type", "application/json")
@@ -894,9 +950,10 @@ func statsHandler(w http.ResponseWriter, r *http.Request) {
 	keys := make([]map[string]interface{}, 0, len(rotator.keys))
 	var totalRequests int64
 
-	for _, entry := range rotator.keys {
+	for i, entry := range rotator.keys {
 		entry.mu.Lock()
 		keyStat := map[string]interface{}{
+			"index":       i,
 			"masked_key":  entry.Key,
 			"state":       entry.State.String(),
 			"usage_count": entry.UsageCount,
@@ -918,6 +975,133 @@ func statsHandler(w http.ResponseWriter, r *http.Request) {
 		"strategy":       rotator.strategy,
 	}
 
+	if totalRequests > 0 {
+		numKeys := int64(len(rotator.keys))
+		if numKeys > 0 {
+			idealPerKey := float64(totalRequests) / float64(numKeys)
+			var sumSquaredDiff float64
+			for _, entry := range rotator.keys {
+				entry.mu.Lock()
+				dev := float64(entry.UsageCount) - idealPerKey
+				sumSquaredDiff += dev * dev
+				if totalRequests > 0 {
+					keyStat := findKeyStat(keys, entry.Key)
+					if keyStat != nil {
+						keyStat["usage_pct"] = float64(entry.UsageCount) / float64(totalRequests) * 100
+					}
+				}
+				entry.mu.Unlock()
+			}
+			stdDev := math.Sqrt(sumSquaredDiff / float64(numKeys))
+			var coeffVar float64
+			if idealPerKey > 0 {
+				coeffVar = stdDev / idealPerKey
+			}
+			result["distribution"] = map[string]interface{}{
+				"ideal_per_key":      idealPerKey,
+				"std_dev":           stdDev,
+				"coefficient_of_var": coeffVar,
+				"fairness_ratio":     fairnessRatio(rotator.keys, totalRequests),
+			}
+		}
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(result) //nolint:errcheck
+}
+
+func findKeyStat(keys []map[string]interface{}, maskedKey string) map[string]interface{} {
+	for _, ks := range keys {
+		if ks["masked_key"] == maskedKey {
+			return ks
+		}
+	}
+	return nil
+}
+
+func fairnessRatio(entries []*KeyEntry, totalRequests int64) float64 {
+	if totalRequests == 0 || len(entries) <= 1 {
+		return 1.0
+	}
+	var minUsage, maxUsage int64
+	minUsage = math.MaxInt64
+	for _, entry := range entries {
+		entry.mu.Lock()
+		if entry.UsageCount < minUsage {
+			minUsage = entry.UsageCount
+		}
+		if entry.UsageCount > maxUsage {
+			maxUsage = entry.UsageCount
+		}
+		entry.mu.Unlock()
+	}
+	if maxUsage == 0 {
+		return 1.0
+	}
+	return float64(minUsage) / float64(maxUsage)
+}
+
+func totalUsageCount(entries []*KeyEntry) int64 {
+	var total int64
+	for _, entry := range entries {
+		entry.mu.Lock()
+		total += entry.UsageCount
+		entry.mu.Unlock()
+	}
+	return total
+}
+
+func keyControlHandler(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	path := strings.Trim(r.URL.Path, "/")
+	parts := strings.Split(path, "/")
+
+	if len(parts) != 4 || parts[0] != "admin" || parts[1] != "keys" {
+		http.Error(w, "invalid path, expected /admin/keys/{index}/{action}", http.StatusBadRequest)
+		return
+	}
+
+	index, err := strconv.Atoi(parts[2])
+	if err != nil {
+		http.Error(w, "invalid key index", http.StatusBadRequest)
+		return
+	}
+
+	action := parts[3]
+	var actionErr error
+	switch action {
+	case "enable":
+		actionErr = rotator.EnableKey(index)
+	case "disable":
+		actionErr = rotator.DisableKey(index)
+	case "reset":
+		actionErr = rotator.ResetKeyStats(index)
+	default:
+		http.Error(w, "unknown action, expected enable|disable|reset", http.StatusBadRequest)
+		return
+	}
+
+	if actionErr != nil {
+		http.Error(w, actionErr.Error(), http.StatusBadRequest)
+		return
+	}
+
+	result := map[string]interface{}{
+		"ok":      true,
+		"index":   index,
+		"action":  action,
+	}
+	entry := rotator.keys[index]
+	entry.mu.Lock()
+	result["key"] = entry.Key
+	result["state"] = entry.State.String()
+	result["usage_count"] = entry.UsageCount
+	entry.mu.Unlock()
+
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(result) //nolint:errcheck
 }
@@ -931,6 +1115,7 @@ var (
 	requestDuration    *prometheus.HistogramVec
 	keyCooldownTotal   *prometheus.CounterVec
 	upstreamErrorsTotal *prometheus.CounterVec
+	keyFairness        prometheus.GaugeFunc
 )
 
 func initMetrics() {
@@ -983,12 +1168,23 @@ func initMetrics() {
 		[]string{"key", "error_type"},
 	)
 
+	keyFairness = prometheus.NewGaugeFunc(
+		prometheus.GaugeOpts{
+			Name: "tavily_router_key_distribution_fairness",
+			Help: "Fairness ratio: min_usage / max_usage across keys (1.0 = perfectly even, 0.0 = completely skewed)",
+		},
+		func() float64 {
+			return fairnessRatio(rotator.keys, totalUsageCount(rotator.keys))
+		},
+	)
+
 	prometheus.MustRegister(requestsTotal)
 	prometheus.MustRegister(keyUsageTotal)
 	prometheus.MustRegister(keyHealthy)
 	prometheus.MustRegister(requestDuration)
 	prometheus.MustRegister(keyCooldownTotal)
 	prometheus.MustRegister(upstreamErrorsTotal)
+	prometheus.MustRegister(keyFairness)
 
 	// Initialize gauges for all keys
 	for _, entry := range rotator.keys {
@@ -1102,6 +1298,7 @@ func main() {
 
 	// Admin endpoints with basic auth
 	mux.HandleFunc("/admin/stats", basicAuthMiddleware(statsHandler))
+	mux.HandleFunc("/admin/keys/", basicAuthMiddleware(keyControlHandler))
 
 	// Prometheus metrics
 	if cfg.EnablePrometheus {

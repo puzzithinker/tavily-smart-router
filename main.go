@@ -1051,6 +1051,22 @@ func totalUsageCount(entries []*KeyEntry) int64 {
 	return total
 }
 
+func updateUsagePctMetric() {
+	if keyUsagePct == nil {
+		return
+	}
+	total := totalUsageCount(rotator.keys)
+	for _, entry := range rotator.keys {
+		var pct float64
+		if total > 0 {
+			entry.mu.Lock()
+			pct = float64(entry.UsageCount) / float64(total)
+			entry.mu.Unlock()
+		}
+		keyUsagePct.WithLabelValues(entry.Key).Set(pct)
+	}
+}
+
 func keyControlHandler(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
@@ -1115,6 +1131,7 @@ var (
 	requestDuration    *prometheus.HistogramVec
 	keyCooldownTotal   *prometheus.CounterVec
 	upstreamErrorsTotal *prometheus.CounterVec
+	keyUsagePct        *prometheus.GaugeVec
 	keyFairness        prometheus.GaugeFunc
 )
 
@@ -1168,6 +1185,14 @@ func initMetrics() {
 		[]string{"key", "error_type"},
 	)
 
+	keyUsagePct = prometheus.NewGaugeVec(
+		prometheus.GaugeOpts{
+			Name: "tavily_router_key_usage_pct",
+			Help: "Percentage of total requests handled by each key (0.0 to 1.0). Updated every 10 seconds.",
+		},
+		[]string{"key"},
+	)
+
 	keyFairness = prometheus.NewGaugeFunc(
 		prometheus.GaugeOpts{
 			Name: "tavily_router_key_distribution_fairness",
@@ -1184,6 +1209,7 @@ func initMetrics() {
 	prometheus.MustRegister(requestDuration)
 	prometheus.MustRegister(keyCooldownTotal)
 	prometheus.MustRegister(upstreamErrorsTotal)
+	prometheus.MustRegister(keyUsagePct)
 	prometheus.MustRegister(keyFairness)
 
 	// Initialize gauges for all keys
@@ -1304,6 +1330,14 @@ func main() {
 	if cfg.EnablePrometheus {
 		initMetrics()
 		mux.Handle("/metrics", promhttp.Handler())
+		go func() {
+			ticker := time.NewTicker(10 * time.Second)
+			defer ticker.Stop()
+			updateUsagePctMetric()
+			for range ticker.C {
+				updateUsagePctMetric()
+			}
+		}()
 	}
 
 	srv := &http.Server{

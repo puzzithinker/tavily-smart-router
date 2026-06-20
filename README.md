@@ -235,6 +235,7 @@ Prometheus metrics (when `enable_prometheus` is `true`).
 | `tavily_router_request_duration_seconds` | Histogram | `key` | Request latency distribution |
 | `tavily_router_key_cooldown_total` | Counter | `key` | Times each key entered cooldown |
 | `tavily_router_upstream_errors_total` | Counter | `key`, `error_type` | Upstream errors by type |
+| `tavily_router_key_usage_pct` | Gauge | `key` | Each key's share of total traffic (0.0–1.0). Updated every 10s |
 
 Error types: `rate_limit`, `auth_error`, `server_error`, `timeout`, `unknown`.
 

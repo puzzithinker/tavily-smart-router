@@ -162,7 +162,7 @@
       "targets": [
         {
           "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
-          "expr": "tavily_router_key_usage_total / on() group_left() sum(tavily_router_key_usage_total)",
+          "expr": "tavily_router_key_usage_pct",
           "legendFormat": "{{key}}",
           "refId": "A"
         }

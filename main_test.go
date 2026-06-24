@@ -1655,6 +1655,36 @@ func TestMarkFailDoesNotAffectDisabled(t *testing.T) {
 	}
 }
 
+// Regression test: MarkCooldown must NOT overwrite a manually disabled key.
+// Without the guard in MarkCooldown, an in-flight 429/432/433/timeout response
+// arriving after admin disable would flip the key to KeyCooldown, and PickKey's
+// cooldown-recovery logic would resurrect it as KeyHealthy — silently undoing
+// the manual disable and sending traffic to a key the operator took offline.
+func TestMarkCooldownDoesNotAffectDisabled(t *testing.T) {
+	setupTestGlobals([]string{"key0"}, "round_robin")
+
+	// Seed non-default field values so we can prove MarkCooldown performed
+	// NONE of its mutations (state, cooldown, fail-count reset).
+	rotator.keys[0].mu.Lock()
+	rotator.keys[0].FailCount = 5
+	rotator.keys[0].mu.Unlock()
+	rotator.MarkDisabled(rotator.keys[0])
+
+	rotator.MarkCooldown(rotator.keys[0], 60*time.Second)
+
+	rotator.keys[0].mu.Lock()
+	defer rotator.keys[0].mu.Unlock()
+	if rotator.keys[0].State != KeyDisabled {
+		t.Errorf("State after MarkCooldown on disabled = %d, want %d (KeyDisabled)", rotator.keys[0].State, KeyDisabled)
+	}
+	if !rotator.keys[0].CooldownUntil.IsZero() {
+		t.Errorf("CooldownUntil should remain zero on disabled key, got %v", rotator.keys[0].CooldownUntil)
+	}
+	if rotator.keys[0].FailCount != 5 {
+		t.Errorf("FailCount should be untouched on disabled key = %d, want 5", rotator.keys[0].FailCount)
+	}
+}
+
 // --- Health Check POST Body Tests ---
 
 func TestHealthHandler_SendsPOSTWithBody(t *testing.T) {

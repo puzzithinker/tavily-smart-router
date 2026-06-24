@@ -329,6 +329,13 @@ func (kr *KeyRotator) MarkSuccess(key *KeyEntry) {
 func (kr *KeyRotator) MarkCooldown(key *KeyEntry, duration time.Duration) {
 	key.mu.Lock()
 	defer key.mu.Unlock()
+
+	// Guard against in-flight retryable responses (429/432/433/timeout)
+	// resurrecting a manually disabled key via PickKey's cooldown-recovery path.
+	if key.State == KeyDisabled {
+		return
+	}
+
 	key.State = KeyCooldown
 	key.CooldownUntil = time.Now().Add(duration)
 	key.FailCount = 0

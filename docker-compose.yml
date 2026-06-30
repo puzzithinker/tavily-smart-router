@@ -8,10 +8,11 @@ services:
       - "8082:8082"
     volumes:
       - ./config.json:/config.json:ro
-      - router-state:/state
+      - ./state:/state
     environment:
       - TAVILY_CONFIG=/config.json
       - TAVILY_STATE_FILE=/state/state.json
+    user: "65534:65534"
     networks:
       - routers
     restart: unless-stopped
@@ -25,6 +26,3 @@ networks:
   routers:
     name: smart-routers
     external: true
-
-volumes:
-  router-state:

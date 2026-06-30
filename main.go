@@ -183,13 +183,14 @@ type KeyEntry struct {
 }
 
 type KeyRotator struct {
-	keys      []*KeyEntry
-	strategy  string
-	counter   atomic.Int64
-	mu        sync.Mutex
-	stateFile string
-	saveCh    chan struct{}
-	stopCh    chan struct{}
+	keys       []*KeyEntry
+	strategy   string
+	counter    atomic.Int64
+	mu         sync.Mutex
+	stateFile  string
+	saveCh     chan struct{}
+	stopCh     chan struct{}
+	saveLogged bool
 }
 
 func NewKeyRotator(keys []string, strategy string) *KeyRotator {
@@ -339,6 +340,11 @@ func (kr *KeyRotator) SaveState() error {
 		return fmt.Errorf("renaming state file: %w", err)
 	}
 
+	if !kr.saveLogged {
+		slog.Info("state_save_ok", "file", kr.stateFile)
+		kr.saveLogged = true
+	}
+
 	return nil
 }
 
@@ -356,6 +362,19 @@ func (kr *KeyRotator) saveLoop() {
 	ticker := time.NewTicker(5 * time.Second)
 	defer ticker.Stop()
 
+	var saveFailed bool
+	doSave := func() {
+		if err := kr.SaveState(); err != nil {
+			if !saveFailed {
+				slog.Error("state_save_failed", "error", err, "file", kr.stateFile)
+				saveFailed = true
+			}
+		} else if saveFailed {
+			slog.Info("state_save_recovered", "file", kr.stateFile)
+			saveFailed = false
+		}
+	}
+
 	for {
 		select {
 		case <-kr.saveCh:
@@ -368,17 +387,11 @@ func (kr *KeyRotator) saveLoop() {
 				}
 				break
 			}
-			if err := kr.SaveState(); err != nil {
-				slog.Error("state_save_failed", "error", err)
-			}
+			doSave()
 		case <-ticker.C:
-			if err := kr.SaveState(); err != nil {
-				slog.Error("state_save_failed", "error", err)
-			}
+			doSave()
 		case <-kr.stopCh:
-			if err := kr.SaveState(); err != nil {
-				slog.Error("state_save_failed", "error", err)
-			}
+			doSave()
 			return
 		}
 	}

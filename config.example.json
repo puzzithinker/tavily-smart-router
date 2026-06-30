@@ -11,5 +11,6 @@
   "admin_pass": "",
   "enable_prometheus": false,
   "enable_request_log": false,
-  "log_file": ""
+  "log_file": "",
+  "state_file": "state.json"
 }

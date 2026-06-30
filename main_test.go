@@ -10,6 +10,7 @@ import (
 	"net/http/httptest"
 	"net/url"
 	"os"
+	"path/filepath"
 	"strings"
 	"sync"
 	"testing"
@@ -2928,4 +2929,178 @@ func TestHealthCheckDistinguishesQuotaFromAuth(t *testing.T) {
 	if result401["upstream"] != "auth_failed" {
 		t.Errorf("401 upstream = %v, want auth_failed (NOT quota_exhausted)", result401["upstream"])
 	}
+}
+
+// --- State Persistence Tests ---
+
+func TestSaveStateRoundTrip(t *testing.T) {
+	setupTestGlobals([]string{"key0", "key1", "key2"}, "least_used")
+
+	stateFile := filepath.Join(t.TempDir(), "state.json")
+	rotator.stateFile = stateFile
+
+	rotator.MarkDisabled(rotator.keys[0])
+	rotator.MarkCooldown(rotator.keys[1], 60*time.Second)
+	rotator.keys[2].mu.Lock()
+	rotator.keys[2].UsageCount = 42
+	rotator.keys[2].mu.Unlock()
+
+	if err := rotator.SaveState(); err != nil {
+		t.Fatalf("SaveState() error: %v", err)
+	}
+
+	newRotator := NewKeyRotator([]string{"key0", "key1", "key2"}, "least_used")
+	newRotator.stateFile = stateFile
+	if err := newRotator.LoadState(); err != nil {
+		t.Fatalf("LoadState() error: %v", err)
+	}
+
+	if newRotator.keys[0].State != KeyDisabled {
+		t.Errorf("key0 State = %d, want %d (disabled)", newRotator.keys[0].State, KeyDisabled)
+	}
+	if newRotator.keys[1].State != KeyCooldown {
+		t.Errorf("key1 State = %d, want %d (cooldown)", newRotator.keys[1].State, KeyCooldown)
+	}
+	if newRotator.keys[2].State != KeyHealthy {
+		t.Errorf("key2 State = %d, want %d (healthy)", newRotator.keys[2].State, KeyHealthy)
+	}
+	if newRotator.keys[2].UsageCount != 42 {
+		t.Errorf("key2 UsageCount = %d, want 42", newRotator.keys[2].UsageCount)
+	}
+}
+
+func TestLoadStateMissingFile(t *testing.T) {
+	setupTestGlobals([]string{"key0"}, "round_robin")
+
+	rotator.stateFile = filepath.Join(t.TempDir(), "nonexistent.json")
+	if err := rotator.LoadState(); err != nil {
+		t.Errorf("LoadState() on missing file should not error, got: %v", err)
+	}
+	if rotator.keys[0].State != KeyHealthy {
+		t.Errorf("key0 State = %d, want %d (healthy — no file to load)", rotator.keys[0].State, KeyHealthy)
+	}
+}
+
+func TestLoadStateCorruptFile(t *testing.T) {
+	setupTestGlobals([]string{"key0"}, "round_robin")
+
+	stateFile := filepath.Join(t.TempDir(), "state.json")
+	if err := os.WriteFile(stateFile, []byte("{not valid json"), 0644); err != nil {
+		t.Fatalf("write file: %v", err)
+	}
+
+	rotator.stateFile = stateFile
+	if err := rotator.LoadState(); err == nil {
+		t.Error("LoadState() on corrupt file should return error, got nil")
+	}
+	if rotator.keys[0].State != KeyHealthy {
+		t.Errorf("key0 State after corrupt load = %d, want %d (healthy — fallback)", rotator.keys[0].State, KeyHealthy)
+	}
+}
+
+func TestPersistenceRestoresDisabledAcrossRestart(t *testing.T) {
+	keys := []string{"key0", "key1", "key2"}
+	stateFile := filepath.Join(t.TempDir(), "state.json")
+
+	original := NewKeyRotator(keys, "least_used")
+	original.stateFile = stateFile
+	original.MarkDisabled(original.keys[0])
+	if err := original.SaveState(); err != nil {
+		t.Fatalf("SaveState() error: %v", err)
+	}
+
+	restarted := NewKeyRotator(keys, "least_used")
+	restarted.stateFile = stateFile
+	if err := restarted.LoadState(); err != nil {
+		t.Fatalf("LoadState() error: %v", err)
+	}
+
+	if restarted.keys[0].State != KeyDisabled {
+		t.Fatalf("key0 State after restart = %d, want %d (disabled)", restarted.keys[0].State, KeyDisabled)
+	}
+
+	_, err := restarted.PickKey()
+	if err != nil {
+		t.Fatalf("PickKey() error with key0 disabled: %v", err)
+	}
+
+	for i := 0; i < 20; i++ {
+		key, err := restarted.PickKey()
+		if err != nil {
+			t.Fatalf("PickKey() iteration %d error: %v", i, err)
+		}
+		if key == restarted.keys[0] {
+			t.Errorf("iteration %d: picked disabled key0!", i)
+		}
+	}
+}
+
+func TestSaveStateAtomicWrite(t *testing.T) {
+	setupTestGlobals([]string{"key0"}, "round_robin")
+
+	stateFile := filepath.Join(t.TempDir(), "state.json")
+	rotator.stateFile = stateFile
+	rotator.MarkDisabled(rotator.keys[0])
+
+	if err := rotator.SaveState(); err != nil {
+		t.Fatalf("SaveState() error: %v", err)
+	}
+
+	data, err := os.ReadFile(stateFile)
+	if err != nil {
+		t.Fatalf("read state file: %v", err)
+	}
+	if !json.Valid(data) {
+		t.Error("state file is not valid JSON — atomic write produced corrupt file")
+	}
+
+	var ps persistedState
+	if err := json.Unmarshal(data, &ps); err != nil {
+		t.Fatalf("unmarshal state file: %v", err)
+	}
+	if ps.Version != 1 {
+		t.Errorf("state version = %d, want 1", ps.Version)
+	}
+	if len(ps.Keys) != 1 {
+		t.Fatalf("keys in state = %d, want 1", len(ps.Keys))
+	}
+	if ps.Keys[0].State != "disabled" {
+		t.Errorf("state file key0 State = %q, want \"disabled\"", ps.Keys[0].State)
+	}
+}
+
+func TestStateFileOmitsRawKeys(t *testing.T) {
+	setupTestGlobals([]string{"tvly-secret-key-12345"}, "round_robin")
+
+	stateFile := filepath.Join(t.TempDir(), "state.json")
+	rotator.stateFile = stateFile
+	if err := rotator.SaveState(); err != nil {
+		t.Fatalf("SaveState() error: %v", err)
+	}
+
+	data, err := os.ReadFile(stateFile)
+	if err != nil {
+		t.Fatalf("read state file: %v", err)
+	}
+	if strings.Contains(string(data), "tvly-secret-key-12345") {
+		t.Error("state file contains raw API key — security leak!")
+	}
+	if !strings.Contains(string(data), "tvly-") {
+		t.Error("state file should contain masked key prefix")
+	}
+}
+
+func TestPersistenceDisabledWhenNoFile(t *testing.T) {
+	setupTestGlobals([]string{"key0"}, "round_robin")
+
+	rotator.stateFile = ""
+	rotator.saveCh = nil
+
+	if err := rotator.SaveState(); err != nil {
+		t.Errorf("SaveState() with empty path should be no-op, got: %v", err)
+	}
+	if err := rotator.LoadState(); err != nil {
+		t.Errorf("LoadState() with empty path should be no-op, got: %v", err)
+	}
+	rotator.triggerSave()
 }

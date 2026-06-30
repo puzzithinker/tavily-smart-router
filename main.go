@@ -13,6 +13,7 @@ import (
 	"net/url"
 	"os"
 	"os/signal"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"sync"
@@ -42,6 +43,7 @@ type Config struct {
 	EnablePrometheus          bool     `json:"enable_prometheus"`
 	EnableRequestLog          bool     `json:"enable_request_log"`
 	LogFile                   string   `json:"log_file"`
+	StateFile                 string   `json:"state_file"`
 }
 
 func LoadConfig(path string) (*Config, error) {
@@ -77,6 +79,9 @@ func LoadConfig(path string) (*Config, error) {
 	if cfg.HealthCheckTimeoutSeconds == 0 {
 		cfg.HealthCheckTimeoutSeconds = 10
 	}
+	if cfg.StateFile == "" {
+		cfg.StateFile = "state.json"
+	}
 
 	// Env overrides (priority over config file)
 	if envKeys := os.Getenv("TAVILY_KEYS"); envKeys != "" {
@@ -100,6 +105,9 @@ func LoadConfig(path string) (*Config, error) {
 		if sec, err := strconv.Atoi(v); err == nil {
 			cfg.QuotaCooldownSec = sec
 		}
+	}
+	if v := os.Getenv("TAVILY_STATE_FILE"); v != "" {
+		cfg.StateFile = v
 	}
 
 	if err := cfg.Validate(); err != nil {
@@ -175,10 +183,13 @@ type KeyEntry struct {
 }
 
 type KeyRotator struct {
-	keys     []*KeyEntry
-	strategy string
-	counter  atomic.Int64
-	mu       sync.Mutex
+	keys      []*KeyEntry
+	strategy  string
+	counter   atomic.Int64
+	mu        sync.Mutex
+	stateFile string
+	saveCh    chan struct{}
+	stopCh    chan struct{}
 }
 
 func NewKeyRotator(keys []string, strategy string) *KeyRotator {
@@ -194,6 +205,190 @@ func NewKeyRotator(keys []string, strategy string) *KeyRotator {
 		keys:     entries,
 		strategy: strategy,
 	}
+}
+
+// keyStateRecord is the on-disk representation of a single key's state.
+// RawKey is intentionally omitted — state files may sit on mounted volumes
+// and must not leak secret key material. We match by masked key on load.
+type keyStateRecord struct {
+	MaskedKey     string    `json:"masked_key"`
+	State         string    `json:"state"`
+	CooldownUntil time.Time `json:"cooldown_until,omitempty"`
+	UsageCount    int64     `json:"usage_count"`
+	FailCount     int64     `json:"fail_count"`
+	LastUsed      time.Time `json:"last_used,omitempty"`
+}
+
+type persistedState struct {
+	Version int              `json:"version"`
+	Keys    []keyStateRecord `json:"keys"`
+}
+
+func (kr *KeyRotator) StartPersistence(stateFile string) error {
+	if stateFile == "" {
+		return nil
+	}
+	kr.stateFile = stateFile
+	kr.saveCh = make(chan struct{}, 1)
+	kr.stopCh = make(chan struct{})
+
+	if err := kr.LoadState(); err != nil {
+		slog.Warn("state_load_failed", "file", stateFile, "error", err)
+	}
+	go kr.saveLoop()
+	return nil
+}
+
+func (kr *KeyRotator) LoadState() error {
+	if kr.stateFile == "" {
+		return nil
+	}
+	data, err := os.ReadFile(kr.stateFile)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil
+		}
+		return fmt.Errorf("reading state file: %w", err)
+	}
+
+	var ps persistedState
+	if err := json.Unmarshal(data, &ps); err != nil {
+		return fmt.Errorf("parsing state file: %w", err)
+	}
+	if ps.Version != 1 {
+		return fmt.Errorf("unsupported state version: %d", ps.Version)
+	}
+
+	restored := 0
+	for i, entry := range kr.keys {
+		if i >= len(ps.Keys) {
+			break
+		}
+		r := ps.Keys[i]
+		if r.MaskedKey != entry.Key {
+			continue
+		}
+		entry.mu.Lock()
+		switch r.State {
+		case "healthy":
+			entry.State = KeyHealthy
+		case "cooldown":
+			entry.State = KeyCooldown
+			entry.CooldownUntil = r.CooldownUntil
+		case "disabled":
+			entry.State = KeyDisabled
+		default:
+			entry.mu.Unlock()
+			continue
+		}
+		entry.UsageCount = r.UsageCount
+		entry.FailCount = r.FailCount
+		entry.LastUsed = r.LastUsed
+		entry.mu.Unlock()
+		restored++
+	}
+
+	slog.Info("state_loaded", "file", kr.stateFile, "restored", restored, "total", len(kr.keys))
+	return nil
+}
+
+func (kr *KeyRotator) SaveState() error {
+	if kr.stateFile == "" {
+		return nil
+	}
+
+	records := make([]keyStateRecord, 0, len(kr.keys))
+	for _, entry := range kr.keys {
+		entry.mu.Lock()
+		r := keyStateRecord{
+			MaskedKey:  entry.Key,
+			State:      entry.State.String(),
+			UsageCount: entry.UsageCount,
+			FailCount:  entry.FailCount,
+			LastUsed:   entry.LastUsed,
+		}
+		if entry.State == KeyCooldown {
+			r.CooldownUntil = entry.CooldownUntil
+		}
+		entry.mu.Unlock()
+		records = append(records, r)
+	}
+
+	ps := persistedState{Version: 1, Keys: records}
+	data, err := json.MarshalIndent(ps, "", "  ")
+	if err != nil {
+		return fmt.Errorf("marshaling state: %w", err)
+	}
+
+	dir := filepath.Dir(kr.stateFile)
+	tmp, err := os.CreateTemp(dir, ".state-*.json.tmp")
+	if err != nil {
+		return fmt.Errorf("creating temp file: %w", err)
+	}
+	tmpName := tmp.Name()
+	defer os.Remove(tmpName)
+
+	if _, err := tmp.Write(data); err != nil {
+		tmp.Close()
+		return fmt.Errorf("writing temp file: %w", err)
+	}
+	if err := tmp.Close(); err != nil {
+		return fmt.Errorf("closing temp file: %w", err)
+	}
+	if err := os.Rename(tmpName, kr.stateFile); err != nil {
+		return fmt.Errorf("renaming state file: %w", err)
+	}
+
+	return nil
+}
+
+func (kr *KeyRotator) triggerSave() {
+	if kr.saveCh == nil {
+		return
+	}
+	select {
+	case kr.saveCh <- struct{}{}:
+	default:
+	}
+}
+
+func (kr *KeyRotator) saveLoop() {
+	ticker := time.NewTicker(5 * time.Second)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-kr.saveCh:
+			time.Sleep(500 * time.Millisecond)
+			for {
+				select {
+				case <-kr.saveCh:
+					continue
+				default:
+				}
+				break
+			}
+			if err := kr.SaveState(); err != nil {
+				slog.Error("state_save_failed", "error", err)
+			}
+		case <-ticker.C:
+			if err := kr.SaveState(); err != nil {
+				slog.Error("state_save_failed", "error", err)
+			}
+		case <-kr.stopCh:
+			if err := kr.SaveState(); err != nil {
+				slog.Error("state_save_failed", "error", err)
+			}
+			return
+		}
+	}
+}
+
+func (kr *KeyRotator) StopPersistence() {
+	if kr.stopCh == nil {
+		return
+	}
+	kr.stopCh <- struct{}{}
 }
 
 func (kr *KeyRotator) PickKey() (*KeyEntry, error) {
@@ -324,6 +519,7 @@ func (kr *KeyRotator) MarkSuccess(key *KeyEntry) {
 	}
 
 	slog.Info("key_recovered", "key", key.Key)
+	kr.triggerSave()
 }
 
 func (kr *KeyRotator) MarkCooldown(key *KeyEntry, duration time.Duration) {
@@ -346,6 +542,7 @@ func (kr *KeyRotator) MarkCooldown(key *KeyEntry, duration time.Duration) {
 	}
 
 	slog.Info("key_cooldown", "key", key.Key, "duration", duration)
+	kr.triggerSave()
 }
 
 func (kr *KeyRotator) MarkFail(key *KeyEntry) {
@@ -370,6 +567,7 @@ func (kr *KeyRotator) MarkFail(key *KeyEntry) {
 
 		slog.Info("key_cooldown", "key", key.Key, "duration", fmt.Sprintf("%ds", cfg.CooldownSec))
 	}
+	kr.triggerSave()
 }
 
 func (kr *KeyRotator) MarkDisabled(key *KeyEntry) {
@@ -382,6 +580,7 @@ func (kr *KeyRotator) MarkDisabled(key *KeyEntry) {
 	}
 
 	slog.Info("key_disabled", "key", key.Key)
+	kr.triggerSave()
 }
 
 func (kr *KeyRotator) HealthyCount() int {
@@ -429,6 +628,7 @@ func (kr *KeyRotator) EnableKey(index int) error {
 	}
 
 	slog.Info("key_manually_enabled", "key", entry.Key, "index", index)
+	kr.triggerSave()
 	return nil
 }
 
@@ -446,6 +646,7 @@ func (kr *KeyRotator) DisableKey(index int) error {
 	}
 
 	slog.Info("key_manually_disabled", "key", entry.Key, "index", index)
+	kr.triggerSave()
 	return nil
 }
 
@@ -460,6 +661,7 @@ func (kr *KeyRotator) ResetKeyStats(index int) error {
 	entry.mu.Unlock()
 
 	slog.Info("key_stats_reset", "key", entry.Key, "index", index)
+	kr.triggerSave()
 	return nil
 }
 
@@ -1305,6 +1507,11 @@ func main() {
 
 	rotator = NewKeyRotator(cfg.Keys, cfg.Strategy)
 
+	if err := rotator.StartPersistence(cfg.StateFile); err != nil {
+		slog.Error("failed to initialize state persistence", "error", err)
+		os.Exit(1)
+	}
+
 	slog.Info("startup", "keys", rotator.TotalCount(), "strategy", cfg.Strategy, "listen", cfg.ListenAddr, "upstream", cfg.UpstreamBase)
 	slog.Info("startup", "version", version)
 
@@ -1374,6 +1581,8 @@ func main() {
 		slog.Error("server shutdown error", "error", err)
 		os.Exit(1)
 	}
+
+	rotator.StopPersistence()
 
 	if logFile != nil {
 		logFile.Close()

@@ -78,7 +78,8 @@ docker compose up -d
   "admin_pass": "",
   "enable_prometheus": false,
   "enable_request_log": false,
-  "log_file": ""
+  "log_file": "",
+  "state_file": "state.json"
 }
 ```
 
@@ -93,6 +94,7 @@ docker compose up -d
 | `TAVILY_COOLDOWN_SEC` | `cooldown_sec` |
 | `TAVILY_QUOTA_COOLDOWN_SEC` | `quota_cooldown_sec` |
 | `TAVILY_CONFIG` | Config file path (default: `config.json`) |
+| `TAVILY_STATE_FILE` | `state_file` (default: `state.json`) |
 
 ### Config Reference
 
@@ -111,6 +113,7 @@ docker compose up -d
 | `enable_prometheus` | bool | `false` | Enable `/metrics` endpoint |
 | `enable_request_log` | bool | `false` | Enable structured request logging |
 | `log_file` | string | `""` | Log file path (stdout if empty) |
+| `state_file` | string | `state.json` | Key state persistence file. Set to empty to disable. |
 
 ## Usage
 

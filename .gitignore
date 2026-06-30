@@ -19,3 +19,12 @@ Thumbs.db
 
 # Logs
 *.log
+
+# State persistence file
+state.json
+
+# Agent state
+.omo/
+
+# Root-level binary copy
+/tavily-smart-router

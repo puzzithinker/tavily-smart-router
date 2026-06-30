@@ -18,7 +18,8 @@ Complete reference for every HTTP endpoint exposed by tavily-smart-router.
 6. [Metrics Endpoint](#metrics-endpoint)
 7. [Error Response Format](#error-response-format)
 8. [Key State Machine](#key-state-machine)
-9. [HTTP Status Code Classification](#http-status-code-classification)
+9. [State Persistence](#state-persistence)
+10. [HTTP Status Code Classification](#http-status-code-classification)
 
 ---
 
@@ -413,7 +414,7 @@ for i in 0 1 2 3; do
 done
 ```
 
-> **Note**: Key state is held in memory only. Restarting the router resets all keys to `healthy` with zeroed counters. To permanently remove a key, remove it from `config.json` (or `TAVILY_KEYS`) and restart.
+> **Note**: Key state persists across restarts via the state file (default: `state.json`, configurable via `state_file` in config or `TAVILY_STATE_FILE` env var). See [State Persistence](#state-persistence) for details. To permanently remove a key, remove it from `config.json` (or `TAVILY_KEYS`) and restart.
 
 ---
 
@@ -567,6 +568,112 @@ A disabled key is excluded from rotation by `PickKey` in both `round_robin` and 
 | `MarkCooldown` | `if State == KeyDisabled { return }` | 429/432/433/timeout on in-flight request does not resurrect |
 
 This means: if you disable a key while requests are in flight, and those in-flight requests later return a retryable error, the key stays disabled. Only `POST /admin/keys/{index}/enable` can bring it back.
+
+---
+
+## State Persistence
+
+Key state (disabled, cooldown, usage counts, fail counts, last-used timestamps) persists across restarts via a JSON state file. This means a key you disable via the admin API **stays disabled** after a container restart, Pi4 reboot, or binary restart.
+
+### Configuration
+
+| Setting | Config key | Env var | Default | Description |
+|---|---|---|---|---|
+| State file path | `state_file` | `TAVILY_STATE_FILE` | `state.json` | Path to the JSON state file. Set to empty string to disable persistence. |
+
+```json
+{
+  "state_file": "state.json"
+}
+```
+
+```bash
+export TAVILY_STATE_FILE="/data/tavily-router-state.json"
+```
+
+### How it works
+
+1. **On startup**: The router loads `state.json` and restores each key's state. Keys are matched by index (with masked-key verification to detect config changes).
+2. **On state change**: Every `MarkDisabled`, `MarkCooldown`, `MarkSuccess`, `MarkFail`, `EnableKey`, `DisableKey`, and `ResetKeyStats` call triggers a **debounced save** (500ms delay, coalesced). This avoids synchronous disk I/O on every request while ensuring state is saved within ~1 second of any change.
+3. **Periodically**: A safety-net save runs every 5 seconds regardless of state changes.
+4. **On graceful shutdown**: A final save runs on `SIGTERM`/`SIGINT`.
+
+### State file format
+
+```json
+{
+  "version": 1,
+  "keys": [
+    {
+      "masked_key": "tvly-Z...AM",
+      "state": "disabled",
+      "usage_count": 142,
+      "fail_count": 0,
+      "last_used": "2026-06-24T08:30:00Z"
+    },
+    {
+      "masked_key": "tvly-4...BO",
+      "state": "cooldown",
+      "cooldown_until": "2026-06-24T09:30:00Z",
+      "usage_count": 98,
+      "fail_count": 0,
+      "last_used": "2026-06-24T08:29:45Z"
+    }
+  ]
+}
+```
+
+**Security**: The state file contains **masked keys only** (`tvly-Z...AM`), never raw API keys. It is safe to store on mounted volumes, in Docker volumes, or in version control.
+
+### Atomic writes
+
+State is written atomically: a temp file is created in the same directory, written, closed, then renamed over the target file. This prevents corruption from partial writes during power loss or crashes.
+
+### Docker volume mount
+
+For Docker deployments, mount a named volume and set `TAVILY_STATE_FILE`:
+
+```yaml
+services:
+  tavily-router:
+    volumes:
+      - ./config.json:/config.json:ro
+      - router-state:/state
+    environment:
+      - TAVILY_CONFIG=/config.json
+      - TAVILY_STATE_FILE=/state/state.json
+
+volumes:
+  router-state:
+```
+
+This ensures state survives both `docker compose restart` and `docker compose down && up`.
+
+### What happens when config changes
+
+The router matches saved state to current keys **by index**, with masked-key verification:
+
+| Config change | Behavior |
+|---|---|
+| Keys added at the end | New keys start `healthy`; existing keys restore their saved state |
+| Keys removed from the end | Remaining keys restore their saved state |
+| Keys reordered | Masked-key check fails at shifted positions → affected keys start `healthy` |
+| Key replaced with a different one | Masked-key check fails at that index → new key starts `healthy` |
+
+### Disabling persistence
+
+Set `state_file` to empty string (or `TAVILY_STATE_FILE=""`) to disable persistence. State stays in-memory only and is lost on restart. This is useful for testing or when you want a clean start on every restart.
+
+### Recovering from a corrupt state file
+
+If the state file is corrupt, the router logs a warning and continues with all keys `healthy`. Delete the corrupt file to start fresh:
+
+```bash
+rm state.json
+# or in Docker
+docker compose exec tavily-router rm /state/state.json
+docker compose restart tavily-router
+```
 
 ---
 

@@ -946,24 +946,46 @@ func classifyResponse(resp *http.Response) error {
 		return fmt.Errorf("key disabled: status %d", statusCode)
 	}
 
-	// 432 — Tavily key/plan limit exceeded, cooldown key (quotas reset monthly)
+	// 432 — Tavily plan limit or other plan-related error
 	if statusCode == 432 {
+		bodyBytes, _ := io.ReadAll(resp.Body)
+		resp.Body.Close()
+		resp.Body = io.NopCloser(bytes.NewReader(bodyBytes))
+
+		var errBody tavilyErrorBody
+		if json.Unmarshal(bodyBytes, &errBody) == nil {
+			slog.Warn("tavily_432_response", "key", key.Key, "detail", errBody.Detail, "error", errBody.Error, "body", string(bodyBytes))
+		} else {
+			slog.Warn("tavily_432_response", "key", key.Key, "body", string(bodyBytes))
+		}
+
 		rotator.MarkCooldown(key, time.Duration(cfg.QuotaCooldownSec)*time.Second)
 		recordMetrics(ErrorTypeAuth)
 		if holder != nil {
 			holder.result = &ClassificationResult{ShouldRetry: true, StatusCode: statusCode}
 		}
-		return fmt.Errorf("key cooldown: plan limit exceeded (432)")
+		return fmt.Errorf("key cooldown: tavily 432 response")
 	}
 
-	// 433 — Tavily PayGo limit exceeded, cooldown key (quotas reset monthly)
+	// 433 — Tavily PayGo limit or other PayGo-related error
 	if statusCode == 433 {
+		bodyBytes, _ := io.ReadAll(resp.Body)
+		resp.Body.Close()
+		resp.Body = io.NopCloser(bytes.NewReader(bodyBytes))
+
+		var errBody tavilyErrorBody
+		if json.Unmarshal(bodyBytes, &errBody) == nil {
+			slog.Warn("tavily_433_response", "key", key.Key, "detail", errBody.Detail, "error", errBody.Error, "body", string(bodyBytes))
+		} else {
+			slog.Warn("tavily_433_response", "key", key.Key, "body", string(bodyBytes))
+		}
+
 		rotator.MarkCooldown(key, time.Duration(cfg.QuotaCooldownSec)*time.Second)
 		recordMetrics(ErrorTypeAuth)
 		if holder != nil {
 			holder.result = &ClassificationResult{ShouldRetry: true, StatusCode: statusCode}
 		}
-		return fmt.Errorf("key cooldown: paygo limit exceeded (433)")
+		return fmt.Errorf("key cooldown: tavily 433 response")
 	}
 
 	// 429 — rate limit or insufficient quota

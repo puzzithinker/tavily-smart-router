@@ -858,8 +858,22 @@ func proxyHandler(rp *httputil.ReverseProxy, rotator *KeyRotator) http.HandlerFu
 			r.Body.Close()
 		}
 
+		slog.Info("incoming_request",
+			"method", r.Method,
+			"path", r.URL.Path,
+			"remote", r.RemoteAddr,
+			"body", string(bodyBytes),
+		)
+
 		if len(cfg.ParamAliases) > 0 && len(bodyBytes) > 0 {
-			bodyBytes = applyParamAliases(bodyBytes, cfg.ParamAliases)
+			rewritten := applyParamAliases(bodyBytes, cfg.ParamAliases)
+			if !bytes.Equal(rewritten, bodyBytes) {
+				slog.Info("param_alias_applied",
+					"original", string(bodyBytes),
+					"rewritten", string(rewritten),
+				)
+			}
+			bodyBytes = rewritten
 		}
 
 		maxRetries := rotator.TotalCount()

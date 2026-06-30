@@ -845,6 +845,25 @@ func applyParamAliases(body []byte, aliases map[string]string) []byte {
 	return rewritten
 }
 
+func stripAPIKeyFromBody(body []byte) []byte {
+	var fields map[string]json.RawMessage
+	if err := json.Unmarshal(body, &fields); err != nil {
+		return body
+	}
+
+	if _, exists := fields["api_key"]; !exists {
+		return body
+	}
+
+	delete(fields, "api_key")
+
+	rewritten, err := json.Marshal(fields)
+	if err != nil {
+		return body
+	}
+	return rewritten
+}
+
 func proxyHandler(rp *httputil.ReverseProxy, rotator *KeyRotator) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		var bodyBytes []byte
@@ -874,6 +893,14 @@ func proxyHandler(rp *httputil.ReverseProxy, rotator *KeyRotator) http.HandlerFu
 				)
 			}
 			bodyBytes = rewritten
+		}
+
+		if len(bodyBytes) > 0 {
+			stripped := stripAPIKeyFromBody(bodyBytes)
+			if !bytes.Equal(stripped, bodyBytes) {
+				slog.Info("api_key_stripped_from_body")
+				bodyBytes = stripped
+			}
 		}
 
 		maxRetries := rotator.TotalCount()

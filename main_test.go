@@ -3171,3 +3171,51 @@ func TestApplyParamAliasesInvalidJSON(t *testing.T) {
 		t.Errorf("invalid JSON should return original body unchanged")
 	}
 }
+
+func TestStripAPIKeyFromBody(t *testing.T) {
+	tests := []struct {
+		name   string
+		input  string
+		expect string
+	}{
+		{
+			name:   "strips_api_key",
+			input:  `{"query":"test","api_key":"tvly-dev-secret","max_results":1}`,
+			expect: `{"query":"test","max_results":1}`,
+		},
+		{
+			name:   "no_api_key_present",
+			input:  `{"query":"test","max_results":1}`,
+			expect: `{"query":"test","max_results":1}`,
+		},
+		{
+			name:   "only_api_key",
+			input:  `{"api_key":"tvly-dev-secret"}`,
+			expect: `{}`,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			result := stripAPIKeyFromBody([]byte(tt.input))
+			var got, want map[string]interface{}
+			if err := json.Unmarshal(result, &got); err != nil {
+				t.Fatalf("unmarshal result: %v", err)
+			}
+			if err := json.Unmarshal([]byte(tt.expect), &want); err != nil {
+				t.Fatalf("unmarshal expect: %v", err)
+			}
+			if !reflect.DeepEqual(got, want) {
+				t.Errorf("got %s, want %s", string(result), tt.expect)
+			}
+		})
+	}
+}
+
+func TestStripAPIKeyFromBodyInvalidJSON(t *testing.T) {
+	original := []byte(`not json`)
+	result := stripAPIKeyFromBody(original)
+	if !bytes.Equal(result, original) {
+		t.Errorf("invalid JSON should return original body unchanged")
+	}
+}

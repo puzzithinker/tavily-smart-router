@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
@@ -11,6 +12,7 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"sync"
 	"testing"
@@ -3103,4 +3105,69 @@ func TestPersistenceDisabledWhenNoFile(t *testing.T) {
 		t.Errorf("LoadState() with empty path should be no-op, got: %v", err)
 	}
 	rotator.triggerSave()
+}
+
+// --- Param Alias Tests ---
+
+func TestApplyParamAliases(t *testing.T) {
+	aliases := map[string]string{"limit": "max_results"}
+
+	tests := []struct {
+		name   string
+		input  string
+		expect string
+	}{
+		{
+			name:   "limit_to_max_results",
+			input:  `{"query":"test","limit":1}`,
+			expect: `{"query":"test","max_results":1}`,
+		},
+		{
+			name:   "no_alias_present",
+			input:  `{"query":"test","max_results":5}`,
+			expect: `{"query":"test","max_results":5}`,
+		},
+		{
+			name:   "multiple_params_with_alias",
+			input:  `{"query":"AI news","limit":3,"search_depth":"advanced"}`,
+			expect: `{"query":"AI news","max_results":3,"search_depth":"advanced"}`,
+		},
+		{
+			name:   "empty_body",
+			input:  `{}`,
+			expect: `{}`,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			result := applyParamAliases([]byte(tt.input), aliases)
+			var got, want map[string]interface{}
+			if err := json.Unmarshal(result, &got); err != nil {
+				t.Fatalf("unmarshal result: %v", err)
+			}
+			if err := json.Unmarshal([]byte(tt.expect), &want); err != nil {
+				t.Fatalf("unmarshal expect: %v", err)
+			}
+			if !reflect.DeepEqual(got, want) {
+				t.Errorf("got %s, want %s", string(result), tt.expect)
+			}
+		})
+	}
+}
+
+func TestApplyParamAliasesEmptyConfig(t *testing.T) {
+	original := []byte(`{"query":"test","limit":1}`)
+	result := applyParamAliases(original, nil)
+	if !bytes.Equal(result, original) {
+		t.Errorf("with no aliases, body should be unchanged: got %s", string(result))
+	}
+}
+
+func TestApplyParamAliasesInvalidJSON(t *testing.T) {
+	original := []byte(`not json at all`)
+	result := applyParamAliases(original, map[string]string{"limit": "max_results"})
+	if !bytes.Equal(result, original) {
+		t.Errorf("invalid JSON should return original body unchanged")
+	}
 }

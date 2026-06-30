@@ -30,20 +30,21 @@ var version = "dev"
 // --- Config ---
 
 type Config struct {
-	ListenAddr                string   `json:"listen_addr"`
-	UpstreamBase              string   `json:"upstream_base"`
-	Keys                      []string `json:"keys"`
-	Strategy                  string   `json:"strategy"`
-	CooldownSec               int      `json:"cooldown_sec"`
-	MaxFailsBeforeCooldown    int      `json:"max_fails_before_cooldown"`
-	QuotaCooldownSec          int      `json:"quota_cooldown_sec"`
-	HealthCheckTimeoutSeconds int      `json:"health_check_timeout_seconds"`
-	AdminUser                 string   `json:"admin_user"`
-	AdminPass                 string   `json:"admin_pass"`
-	EnablePrometheus          bool     `json:"enable_prometheus"`
-	EnableRequestLog          bool     `json:"enable_request_log"`
-	LogFile                   string   `json:"log_file"`
-	StateFile                 string   `json:"state_file"`
+	ListenAddr                string            `json:"listen_addr"`
+	UpstreamBase              string            `json:"upstream_base"`
+	Keys                      []string          `json:"keys"`
+	Strategy                  string            `json:"strategy"`
+	CooldownSec               int               `json:"cooldown_sec"`
+	MaxFailsBeforeCooldown    int               `json:"max_fails_before_cooldown"`
+	QuotaCooldownSec          int               `json:"quota_cooldown_sec"`
+	HealthCheckTimeoutSeconds int               `json:"health_check_timeout_seconds"`
+	AdminUser                 string            `json:"admin_user"`
+	AdminPass                 string            `json:"admin_pass"`
+	EnablePrometheus          bool              `json:"enable_prometheus"`
+	EnableRequestLog          bool              `json:"enable_request_log"`
+	LogFile                   string            `json:"log_file"`
+	StateFile                 string            `json:"state_file"`
+	ParamAliases              map[string]string `json:"param_aliases"`
 }
 
 func LoadConfig(path string) (*Config, error) {
@@ -818,9 +819,34 @@ func newReverseProxy(upstreamURL *url.URL) *httputil.ReverseProxy {
 	return rp
 }
 
+func applyParamAliases(body []byte, aliases map[string]string) []byte {
+	var fields map[string]json.RawMessage
+	if err := json.Unmarshal(body, &fields); err != nil {
+		return body
+	}
+
+	changed := false
+	for alias, real := range aliases {
+		if _, exists := fields[alias]; exists {
+			fields[real] = fields[alias]
+			delete(fields, alias)
+			changed = true
+		}
+	}
+
+	if !changed {
+		return body
+	}
+
+	rewritten, err := json.Marshal(fields)
+	if err != nil {
+		return body
+	}
+	return rewritten
+}
+
 func proxyHandler(rp *httputil.ReverseProxy, rotator *KeyRotator) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
-		// Buffer the request body for potential retries
 		var bodyBytes []byte
 		if r.Body != nil {
 			var err error
@@ -830,6 +856,10 @@ func proxyHandler(rp *httputil.ReverseProxy, rotator *KeyRotator) http.HandlerFu
 				return
 			}
 			r.Body.Close()
+		}
+
+		if len(cfg.ParamAliases) > 0 && len(bodyBytes) > 0 {
+			bodyBytes = applyParamAliases(bodyBytes, cfg.ParamAliases)
 		}
 
 		maxRetries := rotator.TotalCount()

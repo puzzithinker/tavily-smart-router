@@ -114,6 +114,7 @@ docker compose up -d
 | `enable_request_log` | bool | `false` | Enable structured request logging |
 | `log_file` | string | `""` | Log file path (stdout if empty) |
 | `state_file` | string | `state.json` | Key state persistence file. Set to empty to disable. |
+| `param_aliases` | map | `{}` | Request parameter name aliases. e.g. `{"limit": "max_results"}` rewrites `limit` to `max_results` before forwarding to Tavily. |
 
 ## Usage
 

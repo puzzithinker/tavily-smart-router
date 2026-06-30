@@ -175,7 +175,7 @@ Verifies both key validity and upstream connectivity by sending a real `POST /se
 | `no_healthy_keys` | All keys are in cooldown or disabled |
 | `unreachable` | Tavily API did not respond (network error) |
 | `auth_failed` | Key returned 401/403 — key is invalid |
-| `quota_exhausted` | Key returned 432/433 — quota limit exceeded |
+| `quota_exhausted` | Key returned 432/433 — plan limit or quota exceeded (may also indicate IP-based rate limiting; see [troubleshooting](troubleshooting.md#6-432-response-with-low-credit-usage)) |
 | `rate_limited` | Key returned 429 — rate limited |
 | `marshal_error` | Failed to build health check body |
 | `url_error` | Invalid upstream URL |
@@ -542,7 +542,7 @@ Each key is always in one of three states. After the in-flight-resurrection fix,
 | `healthy` | 2xx response | `healthy` | — |
 | `healthy` | 429 (rate limit) | `cooldown` | Auto after `cooldown_sec` or `Retry-After` |
 | `healthy` | 429 (quota) | `cooldown` | Auto after `quota_cooldown_sec` (default 24h) |
-| `healthy` | 432 (plan limit) | `cooldown` | Auto after `quota_cooldown_sec` |
+| `healthy` | 432 (plan limit or IP rate limit) | `cooldown` | Auto after `quota_cooldown_sec` |
 | `healthy` | 433 (PayGo limit) | `cooldown` | Auto after `quota_cooldown_sec` |
 | `healthy` | 401 / 403 | `disabled` | **Never (manual enable only)** |
 | `healthy` | 5xx (N consecutive) | `cooldown` | Auto after `cooldown_sec` |
@@ -687,8 +687,8 @@ How the router classifies upstream responses and what action it takes:
 | 401 / 403 | Auth failure | `MarkDisabled` | Yes | Disable key, retry with next key |
 | 429 + quota in body | Quota exhausted | `MarkCooldown` (quota) | Yes | Cooldown for `quota_cooldown_sec`, retry |
 | 429 (other) | Rate limited | `MarkCooldown` (rate) | Yes | Cooldown for `Retry-After` or `cooldown_sec`, retry |
-| 432 | Plan limit | `MarkCooldown` (quota) | Yes | Cooldown for `quota_cooldown_sec`, retry |
-| 433 | PayGo limit | `MarkCooldown` (quota) | Yes | Cooldown for `quota_cooldown_sec`, retry |
+| 432 | Plan limit / IP rate limit | `MarkCooldown` (quota) | Yes | Cooldown for `quota_cooldown_sec`, retry. Body is logged for diagnosis. See [troubleshooting](troubleshooting.md#6-432-response-with-low-credit-usage) for 432 with low credit usage. |
+| 433 | PayGo limit | `MarkCooldown` (quota) | Yes | Cooldown for `quota_cooldown_sec`, retry. Body is logged for diagnosis. |
 | 5xx | Server error | `MarkFail` | No | Track fail count; forward response to client |
 | Other 4xx | Client error | `MarkFail` | No | Track fail count; forward response to client |
 | Timeout | Network error | `MarkCooldown` (10s) | No | Short cooldown; forward 502 to client |

@@ -300,8 +300,10 @@ HEALTHY ──→ COOLDOWN ──→ (auto-recover after cooldown_sec or quota_c
     │              │
     │              └──→ HEALTHY (on successful request)
     │
-    └──→ DISABLED (permanent, 401/403 only — requires manual intervention)
+    └──→ DISABLED (401/403 or manual disable — requires manual enable to recover)
 ```
+
+> **Persistence**: Key state persists across restarts via the state file (default: `state.json`). See [API Reference — State Persistence](api-reference.md#state-persistence) for details. A disabled key stays disabled after a container restart or Pi4 reboot.
 
 ### State Transition Rules
 
@@ -309,13 +311,16 @@ HEALTHY ──→ COOLDOWN ──→ (auto-recover after cooldown_sec or quota_c
 |---|---|---|---|
 | HEALTHY | 2xx response | HEALTHY | — |
 | HEALTHY | 429 rate limit | COOLDOWN | Auto after cooldown |
-| HEALTHY | 401/403 | DISABLED | Never |
+| HEALTHY | 401/403 | DISABLED | **Manual enable only** |
 | HEALTHY | 432/433/429-quota | COOLDOWN | Auto after quota_cooldown_sec (default 24h) |
 | HEALTHY | 5xx (Nth consecutive) | COOLDOWN | Auto after cooldown |
 | HEALTHY | 5xx (below threshold) | HEALTHY | — (fail count increments) |
 | COOLDOWN | Cooldown expires | HEALTHY | Available on next pick |
 | COOLDOWN | Successful request | HEALTHY | Early recovery |
-| DISABLED | Any | DISABLED | Permanent |
+| DISABLED | **Any automatic event** | DISABLED | **No automatic recovery** |
+| DISABLED | Admin enable | HEALTHY | **The only exit from disabled** |
+
+> **Note**: `MarkSuccess`, `MarkFail`, and `MarkCooldown` all guard against touching a disabled key. An in-flight retryable response (429/432/433/timeout) arriving after a manual disable will NOT resurrect the key. See [troubleshooting](troubleshooting.md#1-disabled-key-still-used-markcooldown-resurrection) for details.
 
 ### Consecutive Failure Threshold
 
@@ -622,6 +627,8 @@ server {
 
 ## Troubleshooting
 
+> **See also**: [troubleshooting.md](troubleshooting.md) for detailed root-cause analysis of production issues.
+
 ### All Keys Show as Disabled or in Cooldown
 
 This means every key received a 401/403 response (permanently disabled) or all keys are in quota cooldown (432/433/429-quota):
@@ -635,10 +642,19 @@ Common causes:
 - Invalid API keys (401/403 — permanently disabled)
 - Expired keys (401/403 — permanently disabled)
 - Plan limits exceeded (432/433 — temporary cooldown, auto-recovers)
+- **IP-based rate limiting** (432 returned for short-term rate limit, not quota — see [troubleshooting](troubleshooting.md#6-432-response-with-low-credit-usage))
 
 **Fix for 401/403**: Replace keys in config and restart, or update `TAVILY_KEYS` environment variable.
 
-**Fix for 432/433**: Keys will auto-recover after `quota_cooldown_sec` (default 24 hours). Quotas reset monthly.
+**Fix for 432/433**: Keys will auto-recover after `quota_cooldown_sec` (default 24 hours). If the 432 is caused by IP-based rate limiting (keys on separate accounts with low credit usage all returning 432 simultaneously), manually re-enable the keys after a few minutes:
+
+```bash
+curl -u admin:password -X POST http://localhost:8082/admin/keys/1/enable
+curl -u admin:password -X POST http://localhost:8082/admin/keys/2/enable
+curl -u admin:password -X POST http://localhost:8082/admin/keys/3/enable
+```
+
+Or reduce `quota_cooldown_sec` to a shorter duration (e.g. 300 seconds) if this happens frequently.
 
 ### Keys Keep Entering Cooldown
 
